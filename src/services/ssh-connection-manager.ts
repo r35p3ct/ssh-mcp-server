@@ -8,6 +8,7 @@ import {
 import { Logger } from "../utils/logger.js";
 import { collectSystemStatus } from "../utils/status-collector.js";
 import { ToolError } from "../utils/tool-error.js";
+import { normalizeEol } from "../utils/command-guard.js";
 import fs from "fs";
 import path from "path";
 import { pipeline } from "node:stream/promises";
@@ -37,6 +38,9 @@ const ANSI_CSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 
 const COMMAND_TEMPLATE_PLACEHOLDER = "<command>";
 const QUOTED_COMMAND_TEMPLATE_PLACEHOLDER = "<quotedCommand>";
+const REMOTE_PARSE_ERROR_PATTERN =
+  /syntax error|unexpected (?:token|EOF|end of file)|unterminated|looking for matching/i;
+const DIAGNOSTIC_COMMAND_MAX_LENGTH = 1000;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 30000;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 10000;
 const DEFAULT_KEEPALIVE_COUNT_MAX = 3;
@@ -57,6 +61,15 @@ function applyCommandTemplate(template: string, command: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Encode a verbatim script as a single self-contained command (base64-piped
+ * into remote bash) so the remote shell never interprets the script's quoting.
+ */
+function wrapScriptCommand(script: string): string {
+  const encoded = Buffer.from(script, "utf8").toString("base64");
+  return `printf %s '${encoded}' | base64 -d | bash`;
 }
 
 function isPathWithinRoot(candidate: string, root: string): boolean {
@@ -351,12 +364,24 @@ export class SSHConnectionManager {
    * Execute SSH command
    */
   public async executeCommand(
-    cmdString: string,
+    cmdString: string | undefined,
     directory?: string,
     name?: string,
-    options: { timeout?: number } = {},
+    options: { timeout?: number; script?: string } = {},
   ): Promise<string> {
-    return this.runCommandInternal(cmdString, directory, name, options);
+    const { script, ...runOptions } = options;
+    const command =
+      script !== undefined ? wrapScriptCommand(normalizeEol(script)) : cmdString;
+
+    if (typeof command !== "string" || command.trim().length === 0) {
+      throw new ToolError(
+        "COMMAND_VALIDATION_FAILED",
+        "Command must be a non-empty string (provide cmdString or script).",
+        false,
+      );
+    }
+
+    return this.runCommandInternal(command, directory, name, runOptions);
   }
 
   /**
@@ -1170,13 +1195,44 @@ export class SSHConnectionManager {
     return outputSections.join("\n");
   }
 
+  /**
+   * When the remote shell failed to parse the command (classic over-escaping
+   * symptom), append the exact command and a hint so the caller can
+   * self-correct instead of retrying with even more escaping.
+   */
+  private appendParseFailureHint(
+    message: string,
+    output: string,
+    command: string,
+  ): string {
+    if (!REMOTE_PARSE_ERROR_PATTERN.test(output)) {
+      return message;
+    }
+
+    const commandSnippet =
+      command.length > DIAGNOSTIC_COMMAND_MAX_LENGTH
+        ? `${command.slice(0, DIAGNOSTIC_COMMAND_MAX_LENGTH)}…`
+        : command;
+
+    return [
+      message,
+      "",
+      "[hint] The remote shell failed to parse this command.",
+      "cmdString reaches the remote login shell verbatim — use exactly one level of shell quoting and do not add escaping layers for SSH or MCP.",
+      "For multi-line commands or nested quotes (quotes inside quotes), retry with the `script` parameter: its content is sent verbatim to remote bash and needs no escaping.",
+      `[command as executed] ${commandSnippet}`,
+    ].join("\n");
+  }
+
   private async runCommandInternal(
     cmdString: string,
     directory?: string,
     name?: string,
     options: RunCommandOptions = {},
   ): Promise<string> {
-    const validationResult = this.validateCommand(cmdString, name);
+    const normalizedCommand = normalizeEol(cmdString);
+
+    const validationResult = this.validateCommand(normalizedCommand, name);
     if (!validationResult.isAllowed) {
       throw new ToolError(
         "COMMAND_VALIDATION_FAILED",
@@ -1202,13 +1258,13 @@ export class SSHConnectionManager {
     );
 
     if (transportMode === "shell") {
-      return this.runShellCommand(cmdString, directory, name, timeout);
+      return this.runShellCommand(normalizedCommand, directory, name, timeout);
     }
 
     return this.runExecCommand(
       client,
       config,
-      cmdString,
+      normalizedCommand,
       directory,
       timeout,
       key,
@@ -1318,20 +1374,22 @@ export class SSHConnectionManager {
               exitSignal !== undefined && exitSignal !== "";
 
             if (hasNonZeroExitCode || hasExitSignal) {
+              const failureMessage =
+                this.formatCommandFailure(stdout, stderr, exitCode, exitSignal) ||
+                (hasExitSignal
+                  ? `Command terminated by signal ${exitSignal}${
+                      exitCode !== undefined ? ` (exit code ${exitCode})` : ""
+                    }`
+                  : `Command failed with exit code ${exitCode}`);
+
               reject(
                 new ToolError(
                   "COMMAND_EXECUTION_ERROR",
-                  this.formatCommandFailure(
-                    stdout,
-                    stderr,
-                    exitCode,
-                    exitSignal,
-                  ) ||
-                    (hasExitSignal
-                      ? `Command terminated by signal ${exitSignal}${
-                          exitCode !== undefined ? ` (exit code ${exitCode})` : ""
-                        }`
-                      : `Command failed with exit code ${exitCode}`),
+                  this.appendParseFailureHint(
+                    failureMessage,
+                    `${stdout}\n${stderr}`,
+                    commandToRun,
+                  ),
                   false,
                 ),
               );
@@ -1659,8 +1717,12 @@ export class SSHConnectionManager {
           finish(
             new ToolError(
               "COMMAND_EXECUTION_ERROR",
-              this.formatCommandFailure(output, "", matched.exitCode) ||
-                `Command failed with exit code ${matched.exitCode}`,
+              this.appendParseFailureHint(
+                this.formatCommandFailure(output, "", matched.exitCode) ||
+                  `Command failed with exit code ${matched.exitCode}`,
+                output,
+                cmdString,
+              ),
               false,
             ),
           );

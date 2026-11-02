@@ -17,6 +17,14 @@ export class SshMcpServer {
 
   constructor() {
     this.server = new McpServer(SERVER_CONFIG);
+    // The SDK's ServerCapabilities type does not include elicitation yet, so
+    // declare it through a narrowed cast ("elicitation": {} is spec-valid).
+    // Must happen before the transport is connected.
+    (
+      this.server.server as unknown as {
+        registerCapabilities: (capabilities: Record<string, unknown>) => void;
+      }
+    ).registerCapabilities({ elicitation: {} });
 
     this.sshManager = SSHConnectionManager.getInstance();
   }

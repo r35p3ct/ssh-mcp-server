@@ -42,7 +42,7 @@ NPM: [https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server](https://www.npmj
 
 | Tool | Name | Description |
 |---------|-----------|----------|
-| execute-command | Command Execution Tool | Execute SSH commands on remote servers and get results |
+| execute-command | Command Execution Tool | Execute SSH commands or verbatim scripts on remote servers and get results |
 | upload | File Upload Tool | Upload local files to specified locations on remote servers |
 | download | File Download Tool | Download files from remote servers to local specified locations |
 | list-servers | List Servers Tool | List all available SSH server configurations |
@@ -518,6 +518,46 @@ The `execute-command` tool supports timeout options to prevent commands from han
 - Error responses include stable `code`, `message`, and `retriable` fields for easier agent-side handling
 
 This is particularly useful for commands like `ping`, `tail -f`, or other long-running processes that might block execution.
+
+### 📜 Quoting & the `script` Parameter
+
+`cmdString` is passed **verbatim** to the remote login shell (exactly like `ssh host '<cmdString>'`). Use a single level of shell quoting — do **not** add extra escaping layers for SSH or JSON:
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "cmdString": "grep -r 'pattern with spaces' /var/log"
+  }
+}
+```
+
+Commands that need quotes **inside** quotes (nested quoting, e.g. inside `docker exec`, `python -c`, or `bash -c`) are where escaping mistakes happen. For those use the `script` parameter instead: its content is base64-transported and executed verbatim by remote `bash` — **no escaping of quotes is needed at all**:
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "script": "docker exec homeassistant python3 -c \"import sqlite3; c=sqlite3.connect('/config/home-assistant_v2.db'); print(c.execute('SELECT COUNT(*) FROM states').fetchone())\"",
+    "timeout": 15000
+  }
+}
+```
+
+`script` and `cmdString` are mutually exclusive. The `directory` parameter and `commandTemplate` apply to `script` the same way they apply to `cmdString`. Windows-style line endings (`\r\n`) in either parameter are normalized to `\n` before execution. When the remote shell cannot parse a command (e.g. over-escaped quotes), the error response includes the exact command as executed plus a hint to retry with `script`.
+
+### 🛡️ Command Guard
+
+Nothing is hard-blocked — the guard exists so the server is not harmed by accident, while still allowing disk formatting, partitioning and other legitimate work.
+
+- **Read-only commands** (`ls`, `cat`, `docker ps`, `systemctl status`, `curl`, …) execute immediately, no approval.
+- **Write commands** require user approval. The guard distinguishes:
+  - *user-level changes* — files, directories, processes (`rm`, `mkdir`, `sed -i`, interpreters like `bash`/`python3`, file redirects, …)
+  - *system-impacting changes* — disks, services, network, packages, users (`mkfs`, `dd of=/dev/…`, `reboot`, `apt install`, `systemctl restart`, `mount`, `iptables`, …)
+- Approval options offered to the user: **allow once**, **allow this exact command for the session**, **allow ALL commands for the session**, or **deny**. The prompt is shown via MCP elicitation when the client supports it.
+- If the client cannot show interactive prompts, the tool returns a `COMMAND_CONFIRMATION_REQUIRED` error containing a `confirmationId`. Ask the user, then retry the same call with `confirmationId` (add `rememberApproval: true` to allow this exact command for the session). Rejection returns `COMMAND_BLOCKED_BY_USER`.
+- Classification is heuristic and fails closed: unknown verbs, file redirects, subshells and anything ambiguous are treated as writes and asked about.
+- Set `SSH_MCP_GUARD=off` to disable the guard entirely (non-interactive automation).
 
 ### 🗂️ List All SSH Servers
 
