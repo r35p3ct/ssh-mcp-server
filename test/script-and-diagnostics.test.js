@@ -273,13 +273,26 @@ describe('script parameter, EOL normalization and parse-error diagnostics', () =
     const channel = new FakeShellChannel();
     let commandPayload = null;
 
+    // PR #80: probe markers are octal-escaped in printf payloads (\137 = _).
+    const ESC = '\\137';
+    const rxEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
     channel.on('write', (payload) => {
-      const readyId = extractMarkerId(payload, '__MCP_READY__');
-      if (readyId) {
-        setImmediate(() => {
-          channel.emit('data', Buffer.from(`__MCP_READY__${readyId}__\n`));
-        });
-        return;
+      for (const probe of ['__MCP_READY__', '__MCP_CONFIGURE__']) {
+        const prefix =
+          ESC + ESC + probe.slice(2, -2).replace(/_/g, ESC) + ESC + ESC;
+        if (payload.includes(prefix)) {
+          const match = payload.match(
+            new RegExp(`${rxEscape(prefix)}(.+?)${rxEscape(ESC + ESC)}`),
+          );
+          if (match) {
+            const id = match[1].replace(/\\137/g, '_');
+            setImmediate(() => {
+              channel.emit('data', Buffer.from(`${probe}${id}__\n`));
+            });
+          }
+          return;
+        }
       }
       if (payload.includes('__MCP_BEGIN__')) {
         commandPayload = payload;
