@@ -1,3 +1,5 @@
+import type { Algorithms } from "ssh2";
+
 /**
  * SSH connection configuration interface
  */
@@ -13,15 +15,19 @@ export interface SSHConfig {
   tryKeyboard?: boolean; // Enable keyboard-interactive authentication. Password prompts use `password`; non-password prompts (e.g. OTP) use the SSH_MCP_2FA_CODE env var. Default: false
   commandWhitelist?: string[]; // Command whitelist (array of regex strings)
   commandBlacklist?: string[]; // Command blacklist (array of regex strings)
-  socksProxy?: string; // SOCKS proxy URL, e.g. 'socks://user:pass@host:port'
+  proxy?: string; // Proxy URL supporting SOCKS5, HTTP, and HTTPS
+  socksProxy?: string; // Legacy SOCKS5-only proxy URL
+  algorithms?: Algorithms; // Custom SSH algorithms (kex, cipher, serverHostKey, hmac, compress)
   pty?: boolean; // Allocate pseudo-tty for command execution, default: true
   allowedLocalPaths?: string[]; // Allowed local paths for upload/download
-  allowedRemotePaths?: string[]; // Allowed remote paths for SFTP upload/download (POSIX, absolute)
+  allowedRemotePaths?: string[]; // Allowed remote paths for SFTP upload/download (POSIX or Windows drive-absolute)
   transportMode?: "exec" | "shell"; // SSH transport mode, default: exec
   shellReadyTimeoutMs?: number; // Shell readiness probe timeout, default: 10000ms
   shellCommandTimeoutMs?: number; // Shell command timeout override, default: 30000ms
+  commandTimeoutMs?: number; // Exec command timeout override, default: 30000ms
   connectionTimeoutMs?: number; // SSH connection and handshake timeout, default: 30000ms
   sftpTimeoutMs?: number; // SFTP open and transfer timeout, default: 300000ms
+  maxOutputBytes?: number; // Max captured bytes per command (stdout+stderr) before aborting, default: 10485760; set 0 to disable
   keepaliveIntervalMs?: number; // SSH keepalive interval, default: 10000ms
   keepaliveCountMax?: number; // Unanswered keepalive packets before disconnect, default: 3
   commandTemplate?: string; // Command template, use <quotedCommand> for shell arguments or <command> for raw insertion
@@ -86,9 +92,26 @@ export interface ServerStatus {
 }
 
 /**
+ * MCP client transport. stdio is the historical default; http serves Streamable HTTP.
+ */
+export type McpTransport = "stdio" | "http";
+
+/**
+ * Streamable HTTP listen configuration
+ */
+export interface HttpListenConfig {
+  host: string;
+  port: number;
+  path: string;
+  token?: string;
+}
+
+/**
  * Parsed command line arguments result
  */
 export interface ParsedArgs {
   configs: SshConnectionConfigMap;
   preConnect: boolean;
+  mcpTransport: McpTransport;
+  http: HttpListenConfig;
 }

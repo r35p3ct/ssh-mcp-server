@@ -1,5 +1,5 @@
-import { Client, ClientChannel, SFTPWrapper } from "ssh2";
-import { SocksClient } from "socks";
+import { createRequire } from "node:module";
+import type { Client, ClientChannel, Prompt, SFTPWrapper, Stats } from "ssh2";
 import {
   SSHConfig,
   SshConnectionConfigMap,
@@ -9,12 +9,31 @@ import { Logger } from "../utils/logger.js";
 import { collectSystemStatus } from "../utils/status-collector.js";
 import { ToolError } from "../utils/tool-error.js";
 import { normalizeEol } from "../utils/command-guard.js";
+import { shellQuote } from "../utils/shell.js";
+import {
+  assertValidJobId,
+  buildJobKillScript,
+  buildJobListScript,
+  buildJobStartScript,
+  buildJobStatusScript,
+  generateJobId,
+} from "../utils/remote-jobs.js";
 import fs from "fs";
 import path from "path";
+import {
+  isRemotePathWithinRoot,
+  normalizeRemotePath,
+} from "../utils/remote-path.js";
+import type { Duplex } from "node:stream";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { StringDecoder } from "node:string_decoder";
+
+const require = createRequire(import.meta.url);
 
 type RunCommandOptions = {
   timeout?: number;
+  prevalidatedInternalCommand?: boolean;
 };
 
 type LocalPathPurpose = "read" | "write";
@@ -25,6 +44,28 @@ type ShellCommandMatch = {
   remainder: string;
 };
 
+/**
+ * Incremental marker scanner state.
+ *
+ * Scanning the accumulated buffer on every chunk is quadratic, and not only
+ * because of the repeated comparisons: `indexOf` needs a flat string, so each
+ * call re-flattens the rope built by the appends and copies the whole buffer
+ * again. `tail` therefore holds just the text that could still start a marker —
+ * the previous scan already ruled out everything before it — so each chunk is
+ * examined once against a short string, and the accumulated buffer is only
+ * touched when a complete marker has been located.
+ *
+ * `tailStart` is the absolute index of `tail[0]` within that buffer, which is
+ * what turns a tail-relative hit back into an absolute position.
+ */
+type ShellScanState = {
+  outputStartIndex: number;
+  tail: string;
+  tailStart: number;
+  countedOutputEndIndex: number;
+  capturedOutputBytes: number;
+};
+
 type SshAuthMethod =
   | "none"
   | "password"
@@ -33,8 +74,23 @@ type SshAuthMethod =
   | "keyboard-interactive"
   | "hostbased";
 
+type SshClientConfig = Record<string, unknown> & {
+  keyboard?: (
+    name: string,
+    instructions: string,
+    instructionsLang: string,
+    prompts: Prompt[],
+    finish: (responses: string[]) => void,
+  ) => void;
+};
+
 const ANSI_OSC_PATTERN = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
 const ANSI_CSI_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+
+// Matches the exit code that `buildShellCommandScript` prints right after the
+// end marker prefix, anchored so it can only be read at the expected offset.
+const SHELL_EXIT_CODE_PATTERN = /^(-?\d+)__(?:\r)?\n/;
+const SHELL_EXIT_CODE_MAX_LENGTH = 32;
 
 const COMMAND_TEMPLATE_PLACEHOLDER = "<command>";
 const QUOTED_COMMAND_TEMPLATE_PLACEHOLDER = "<quotedCommand>";
@@ -42,9 +98,32 @@ const REMOTE_PARSE_ERROR_PATTERN =
   /syntax error|unexpected (?:token|EOF|end of file)|unterminated|looking for matching/i;
 const DIAGNOSTIC_COMMAND_MAX_LENGTH = 1000;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 30000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30000;
+const DEFAULT_JOB_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 10000;
 const DEFAULT_KEEPALIVE_COUNT_MAX = 3;
 const DEFAULT_SFTP_TIMEOUT_MS = 300000;
+const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+const DEFAULT_READ_FILE_BYTES = 64 * 1024;
+const MAX_DIRECTORY_TRANSFER_FILES = 2000;
+
+// ssh2's SFTP ReadStream/WriteStream keep a single request in flight, so
+// transfer throughput is capped at one chunk per round trip regardless of the
+// available bandwidth. fastGet/fastPut pipeline `concurrency` chunks instead,
+// which is what makes large transfers usable on high latency links.
+const SFTP_FAST_TRANSFER_OPTIONS = {
+  concurrency: 64,
+  chunkSize: 32 * 1024,
+} as const;
+
+// Under this size the streaming path already completes in a couple of round
+// trips, so the extra stat fastGet needs would cost more than the concurrency
+// saves. Staying on the streaming path below the threshold also keeps the
+// existing behaviour for files whose reported size is unusable: fastGet/fastPut
+// plan their chunks from that size and treat `size <= 0` as "nothing to
+// transfer", which would silently produce an empty file for pseudo files such
+// as /proc/cpuinfo.
+const SFTP_FAST_TRANSFER_MIN_BYTES = 256 * 1024;
 
 function applyCommandTemplate(template: string, command: string): string {
   const quotedCommand = shellQuote(command);
@@ -59,10 +138,6 @@ function applyCommandTemplate(template: string, command: string): string {
     .join(command);
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 /**
  * Encode a verbatim script as a single self-contained command (base64-piped
  * into remote bash) so the remote shell never interprets the script's quoting.
@@ -70,6 +145,38 @@ function shellQuote(value: string): string {
 function wrapScriptCommand(script: string): string {
   const encoded = Buffer.from(script, "utf8").toString("base64");
   return `printf %s '${encoded}' | base64 -d | bash`;
+}
+
+/**
+ * Heuristic used by read-file: NUL bytes, or a noticeable share of invalid
+ * UTF-8. A page cut may split a multi-byte character at either end, so up to
+ * three replacement characters at each edge are forgiven.
+ */
+function looksBinary(buffer: Buffer): boolean {
+  if (buffer.includes(0)) {
+    return true;
+  }
+  const text = buffer
+    .toString("utf8")
+    .replace(/^\uFFFD{1,3}/, "")
+    .replace(/\uFFFD{1,3}$/, "");
+  if (text.length === 0) {
+    return false;
+  }
+  const invalid = text.split("\uFFFD").length - 1;
+  return invalid / text.length > 0.05;
+}
+
+/**
+ * The caller cannot see the process working directory or the server's path
+ * configuration, so a rejection that only says "must be within an allowed path"
+ * leaves it nothing to correct against. Name the roots instead.
+ */
+function describeAllowedRoots(
+  kind: "local" | "remote",
+  allowedRoots: string[],
+): string {
+  return `Allowed ${kind} paths for this connection: ${allowedRoots.join(", ")}.`;
 }
 
 function isPathWithinRoot(candidate: string, root: string): boolean {
@@ -91,6 +198,30 @@ function redactProxyUrl(proxyUrl: URL): string {
     redactedUrl.password = "***";
   }
   return redactedUrl.toString();
+}
+
+function normalizeUrlHostname(hostname: string): string {
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return hostname.slice(1, -1);
+  }
+  return hostname;
+}
+
+function formatHostPort(host: string, port: number): string {
+  const formattedHost = host.includes(":") && !host.startsWith("[")
+    ? `[${host}]`
+    : host;
+  return `${formattedHost}:${port}`;
+}
+
+function parseProxyPort(proxyUrl: URL, defaultPort?: number): number {
+  const port = proxyUrl.port
+    ? Number.parseInt(proxyUrl.port, 10)
+    : defaultPort;
+  if (!port || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error("Proxy URL must include a valid port");
+  }
+  return port;
 }
 
 function isPasswordPrompt(prompt: string): boolean {
@@ -131,6 +262,9 @@ export class SSHConnectionManager {
   private shellReady: Map<string, boolean> = new Map();
   private shellQueues: Map<string, Promise<unknown>> = new Map();
   private shellBuffers: Map<string, string> = new Map();
+  // A multi-byte character can be split across two TCP chunks, so the channel
+  // needs one decoder for its whole lifetime rather than a decode per chunk.
+  private shellDecoders: Map<string, StringDecoder> = new Map();
   private defaultName: string = "default";
 
   private constructor() {}
@@ -332,7 +466,11 @@ export class SSHConnectionManager {
       });
 
       try {
-        const sshConfig = await this.buildClientConfig(key, config);
+        const { keyboard, ...sshConfig } = await this.buildClientConfig(key, config);
+        // ssh2 通过事件下发交互提示，必须在连接前注册应答回调。
+        if (keyboard) {
+          client.on("keyboard-interactive", keyboard);
+        }
         client.connect(sshConfig);
       } catch (error) {
         rejectOnce(error);
@@ -424,7 +562,10 @@ export class SSHConnectionManager {
     if (purpose === "write" && !parentRealPath) {
       throw new ToolError(
         "LOCAL_PATH_NOT_ALLOWED",
-        "Local path parent directory must exist and be within an allowed local path.",
+        `Local path parent directory must exist and be within an allowed local path. Resolved to: ${resolvedPath}. ${describeAllowedRoots(
+          "local",
+          allowedRoots,
+        )}`,
         false,
       );
     }
@@ -436,7 +577,10 @@ export class SSHConnectionManager {
     if (!isAllowed) {
       throw new ToolError(
         "LOCAL_PATH_NOT_ALLOWED",
-        "Path traversal detected. Local path must be within the working directory or configured allowed local paths for this connection.",
+        `Path traversal detected. Local path resolved to: ${pathToCheck}. ${describeAllowedRoots(
+          "local",
+          allowedRoots,
+        )}`,
         false,
       );
     }
@@ -476,34 +620,46 @@ export class SSHConnectionManager {
         false,
       );
     }
-    if (!path.posix.isAbsolute(remotePath)) {
+    let resolvedPath: string;
+    try {
+      resolvedPath = normalizeRemotePath(remotePath);
+    } catch (error) {
       throw new ToolError(
         "REMOTE_PATH_NOT_ALLOWED",
-        `Remote path must be an absolute POSIX path, got: ${remotePath}`,
+        (error as Error).message,
         false,
       );
     }
-
-    const resolvedPath = path.posix.normalize(remotePath);
     const config = this.getConfig(name);
-    const allowedRoots = config.allowedRemotePaths || [];
+    const allowedRoots = (config.allowedRemotePaths || []).map(
+      (allowedRoot) => {
+        try {
+          return normalizeRemotePath(allowedRoot);
+        } catch (error) {
+          throw new ToolError(
+            "REMOTE_PATH_NOT_ALLOWED",
+            `Invalid allowedRemotePaths entry "${allowedRoot}": ${(error as Error).message}`,
+            false,
+          );
+        }
+      },
+    );
 
     if (allowedRoots.length === 0) {
       return resolvedPath;
     }
 
-    const isAllowed = allowedRoots.some(
-      (allowedRoot) =>
-        resolvedPath === allowedRoot ||
-        resolvedPath.startsWith(
-          allowedRoot.endsWith("/") ? allowedRoot : `${allowedRoot}/`,
-        ),
+    const isAllowed = allowedRoots.some((allowedRoot) =>
+      isRemotePathWithinRoot(resolvedPath, allowedRoot),
     );
 
     if (!isAllowed) {
       throw new ToolError(
         "REMOTE_PATH_NOT_ALLOWED",
-        "Remote path is not within the configured allowedRemotePaths.",
+        `Remote path is not within the configured allowedRemotePaths. Resolved to: ${resolvedPath}. ${describeAllowedRoots(
+          "remote",
+          allowedRoots,
+        )}`,
         false,
       );
     }
@@ -530,6 +686,14 @@ export class SSHConnectionManager {
 
     const validatedLocalPath = this.validateLocalPath(localPath, name, "read");
     const validatedRemotePath = this.validateRemotePath(remotePath, name);
+
+    const localStats = await fs.promises
+      .stat(validatedLocalPath)
+      .catch(() => undefined);
+    if (localStats?.isDirectory()) {
+      return this.uploadDirectory(validatedLocalPath, validatedRemotePath, name);
+    }
+
     const client = await this.ensureConnected(name);
     const sftpTimeoutMs = this.getSftpTimeoutMs(config);
     const sftp = await this.withTimeout(
@@ -540,15 +704,43 @@ export class SSHConnectionManager {
     );
 
     try {
-      await this.withTimeout(
-        pipeline(
-          fs.createReadStream(validatedLocalPath),
-          sftp.createWriteStream(validatedRemotePath),
-        ),
-        sftpTimeoutMs,
-        () => this.invalidateConnection(key),
-        `SFTP upload timed out after ${sftpTimeoutMs}ms`,
+      const localSize = await this.getLocalSizeForFastTransfer(
+        validatedLocalPath,
       );
+
+      if (localSize === undefined) {
+        await this.withTimeout(
+          pipeline(
+            fs.createReadStream(validatedLocalPath),
+            sftp.createWriteStream(validatedRemotePath),
+          ),
+          sftpTimeoutMs,
+          () => this.invalidateConnection(key),
+          `SFTP upload timed out after ${sftpTimeoutMs}ms`,
+        );
+      } else {
+        await this.withTimeout(
+          new Promise<void>((resolve, reject) => {
+            sftp.fastPut(
+              validatedLocalPath,
+              validatedRemotePath,
+              SFTP_FAST_TRANSFER_OPTIONS,
+              (err) => (err ? reject(err) : resolve()),
+            );
+          }),
+          sftpTimeoutMs,
+          () => this.invalidateConnection(key),
+          `SFTP upload timed out after ${sftpTimeoutMs}ms`,
+        );
+        await this.appendUploadTail(
+          sftp,
+          validatedLocalPath,
+          validatedRemotePath,
+          localSize,
+          sftpTimeoutMs,
+          key,
+        );
+      }
       return "File uploaded successfully";
     } catch (error) {
       if (error instanceof ToolError && error.code === "OPERATION_TIMEOUT") {
@@ -604,20 +796,66 @@ export class SSHConnectionManager {
       .slice(2)}`;
 
     try {
-      await this.withTimeout(
-        pipeline(
-          sftp.createReadStream(validatedRemotePath),
-          fs.createWriteStream(tempLocalPath, { flags: "wx" }),
-        ),
-        sftpTimeoutMs,
-        () => this.invalidateConnection(key),
-        `SFTP download timed out after ${sftpTimeoutMs}ms`,
+      const remoteStats = await this.statRemote(sftp, validatedRemotePath).catch(
+        () => undefined,
       );
+      if (remoteStats?.isDirectory()) {
+        return await this.downloadDirectory(
+          sftp,
+          validatedRemotePath,
+          validatedLocalPath,
+          name,
+        );
+      }
+
+      const remoteSize = await this.getRemoteSizeForFastTransfer(
+        sftp,
+        validatedRemotePath,
+        sftpTimeoutMs,
+        key,
+      );
+
+      if (remoteSize === undefined) {
+        await this.withTimeout(
+          pipeline(
+            sftp.createReadStream(validatedRemotePath),
+            fs.createWriteStream(tempLocalPath, { flags: "wx" }),
+          ),
+          sftpTimeoutMs,
+          () => this.invalidateConnection(key),
+          `SFTP download timed out after ${sftpTimeoutMs}ms`,
+        );
+      } else {
+        // fastGet opens the destination with "w", which would drop the
+        // exclusive-create guarantee the streaming path gets from "wx".
+        // Claiming the temp name first keeps it.
+        await fs.promises.writeFile(tempLocalPath, "", { flag: "wx" });
+        await this.withTimeout(
+          new Promise<void>((resolve, reject) => {
+            sftp.fastGet(
+              validatedRemotePath,
+              tempLocalPath,
+              SFTP_FAST_TRANSFER_OPTIONS,
+              (err) => (err ? reject(err) : resolve()),
+            );
+          }),
+          sftpTimeoutMs,
+          () => this.invalidateConnection(key),
+          `SFTP download timed out after ${sftpTimeoutMs}ms`,
+        );
+        await this.appendDownloadTail(
+          sftp,
+          validatedRemotePath,
+          tempLocalPath,
+          sftpTimeoutMs,
+          key,
+        );
+      }
       await fs.promises.rename(tempLocalPath, validatedLocalPath);
       return "File downloaded successfully";
     } catch (error) {
       await this.unlinkIfExists(tempLocalPath);
-      if (error instanceof ToolError && error.code === "OPERATION_TIMEOUT") {
+      if (error instanceof ToolError) {
         throw error;
       }
       if (
@@ -640,6 +878,338 @@ export class SSHConnectionManager {
     }
   }
 
+  private assertSftpAllowed(config: SSHConfig): void {
+    if (this.getTransportMode(config) === "shell") {
+      throw new ToolError(
+        "UNSUPPORTED_IN_SHELL_MODE",
+        "Current bastion shell mode does not support SFTP upload/download.",
+        false,
+      );
+    }
+  }
+
+  private async openSftpFor(name?: string): Promise<{
+    sftp: SFTPWrapper;
+    key: string;
+    timeoutMs: number;
+  }> {
+    const config = this.getConfig(name);
+    this.assertSftpAllowed(config);
+    const key = name || this.defaultName;
+    const client = await this.ensureConnected(name);
+    const timeoutMs = this.getSftpTimeoutMs(config);
+    const sftp = await this.withTimeout(
+      this.openSftp(client),
+      timeoutMs,
+      () => this.invalidateConnection(key),
+      `SFTP open timed out after ${timeoutMs}ms`,
+    );
+    return { sftp, key, timeoutMs };
+  }
+
+  /**
+   * Read a slice of a remote text file over SFTP. Refuses binary content
+   * (NUL bytes) instead of dumping it into the conversation.
+   */
+  public async readFile(
+    remotePath: string,
+    options: { offset?: number; length?: number } = {},
+    name?: string,
+  ): Promise<string> {
+    const validatedRemotePath = this.validateRemotePath(remotePath, name);
+    const { sftp, key, timeoutMs } = await this.openSftpFor(name);
+    const offset = options.offset ?? 0;
+    const length = options.length ?? DEFAULT_READ_FILE_BYTES;
+
+    try {
+      const stats = await this.withTimeout(
+        this.statRemote(sftp, validatedRemotePath),
+        timeoutMs,
+        () => this.invalidateConnection(key),
+        `SFTP stat timed out after ${timeoutMs}ms`,
+      );
+      if (stats.isDirectory()) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `${validatedRemotePath} is a directory; use execute-command with ls to list it.`,
+          false,
+        );
+      }
+
+      const total = stats.size;
+      const start = Math.min(offset, total);
+      const end = Math.min(total, start + length);
+      const chunks: Buffer[] = [];
+      if (end > start) {
+        await this.withTimeout(
+          pipeline(
+            sftp.createReadStream(validatedRemotePath, {
+              start,
+              end: end - 1,
+            }),
+            async function (source: AsyncIterable<Buffer>) {
+              for await (const chunk of source) {
+                chunks.push(chunk);
+              }
+            },
+          ),
+          timeoutMs,
+          () => this.invalidateConnection(key),
+          `SFTP read timed out after ${timeoutMs}ms`,
+        );
+      }
+
+      const buffer = Buffer.concat(chunks);
+      if (looksBinary(buffer)) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `${validatedRemotePath} looks like a binary file; use download instead.`,
+          false,
+        );
+      }
+
+      const header = `[file] ${validatedRemotePath}\n[bytes] ${start}-${end} of ${total}${
+        end < total ? ` (next offset ${end})` : " (end of file)"
+      }\n---\n`;
+      return header + buffer.toString("utf8");
+    } catch (error) {
+      if (error instanceof ToolError) {
+        throw error;
+      }
+      throw new ToolError(
+        "SFTP_ERROR",
+        `File read failed: ${(error as Error).message}`,
+        true,
+      );
+    } finally {
+      this.closeSftp(sftp);
+    }
+  }
+
+  /**
+   * Write text content to a remote file over SFTP, so multi-line content and
+   * quotes never pass through shell quoting.
+   */
+  public async writeFile(
+    remotePath: string,
+    content: string,
+    options: { append?: boolean; mode?: number } = {},
+    name?: string,
+  ): Promise<string> {
+    const validatedRemotePath = this.validateRemotePath(remotePath, name);
+    const { sftp, key, timeoutMs } = await this.openSftpFor(name);
+    const data = Buffer.from(content, "utf8");
+
+    try {
+      await this.withTimeout(
+        pipeline(
+          Readable.from([data]),
+          sftp.createWriteStream(validatedRemotePath, {
+            flags: options.append ? "a" : "w",
+            ...(options.mode !== undefined ? { mode: options.mode } : {}),
+          }),
+        ),
+        timeoutMs,
+        () => this.invalidateConnection(key),
+        `SFTP write timed out after ${timeoutMs}ms`,
+      );
+      return `${options.append ? "Appended" : "Wrote"} ${data.length} bytes to ${validatedRemotePath}`;
+    } catch (error) {
+      if (error instanceof ToolError) {
+        throw error;
+      }
+      throw new ToolError(
+        "SFTP_ERROR",
+        `File write failed: ${(error as Error).message}`,
+        true,
+      );
+    } finally {
+      this.closeSftp(sftp);
+    }
+  }
+
+  private mkdirRemote(sftp: SFTPWrapper, remoteDir: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      sftp.mkdir(remoteDir, (err) => {
+        if (!err) {
+          resolve();
+          return;
+        }
+        // Most servers only report a generic failure when the directory
+        // already exists, so check before deciding it is a real error.
+        sftp.stat(remoteDir, (statErr, stats) =>
+          !statErr && stats.isDirectory() ? resolve() : reject(err),
+        );
+      });
+    });
+  }
+
+  private readdirRemote(
+    sftp: SFTPWrapper,
+    remoteDir: string,
+  ): Promise<Array<{ filename: string; attrs: Stats }>> {
+    return new Promise((resolve, reject) => {
+      sftp.readdir(remoteDir, (err, list) =>
+        err ? reject(err) : resolve(list),
+      );
+    });
+  }
+
+  /**
+   * Upload a local directory tree file by file, reusing the single-file path
+   * (path validation, fast transfer, timeouts). Symlinks are skipped.
+   */
+  private async uploadDirectory(
+    localDir: string,
+    remoteDir: string,
+    name?: string,
+  ): Promise<string> {
+    const files: Array<{ local: string; remote: string }> = [];
+    const dirs: string[] = [remoteDir];
+    let skipped = 0;
+
+    const walk = async (local: string, remote: string): Promise<void> => {
+      for (const entry of await fs.promises.readdir(local, {
+        withFileTypes: true,
+      })) {
+        const localChild = path.join(local, entry.name);
+        const remoteChild = path.posix.join(remote, entry.name);
+        if (entry.isDirectory()) {
+          dirs.push(remoteChild);
+          await walk(localChild, remoteChild);
+        } else if (entry.isFile()) {
+          files.push({ local: localChild, remote: remoteChild });
+        } else {
+          skipped++;
+        }
+        if (files.length > MAX_DIRECTORY_TRANSFER_FILES) {
+          throw new ToolError(
+            "SFTP_ERROR",
+            `Directory has more than ${MAX_DIRECTORY_TRANSFER_FILES} files; archive it (tar) and upload the archive instead.`,
+            false,
+          );
+        }
+      }
+    };
+    await walk(localDir, remoteDir);
+
+    const { sftp, key, timeoutMs } = await this.openSftpFor(name);
+    try {
+      for (const dir of dirs) {
+        const validatedDir = this.validateRemotePath(dir, name);
+        await this.withTimeout(
+          this.mkdirRemote(sftp, validatedDir),
+          timeoutMs,
+          () => this.invalidateConnection(key),
+          `SFTP mkdir timed out after ${timeoutMs}ms`,
+        );
+      }
+    } catch (error) {
+      if (error instanceof ToolError) {
+        throw error;
+      }
+      throw new ToolError(
+        "SFTP_ERROR",
+        `Creating remote directory failed: ${(error as Error).message}`,
+        true,
+      );
+    } finally {
+      this.closeSftp(sftp);
+    }
+
+    for (const file of files) {
+      try {
+        await this.upload(file.local, file.remote, name);
+      } catch (error) {
+        throw new ToolError(
+          (error as ToolError).code ?? "SFTP_ERROR",
+          `Uploaded ${files.indexOf(file)} of ${files.length} files before failing on ${file.local}: ${(error as Error).message}`,
+          (error as ToolError).retriable ?? true,
+        );
+      }
+    }
+    return `Directory uploaded: ${files.length} files to ${remoteDir}${
+      skipped ? ` (${skipped} non-regular entries such as symlinks skipped)` : ""
+    }`;
+  }
+
+  /**
+   * Download a remote directory tree file by file, reusing the single-file
+   * path. `sftp` is the caller's already open session, used only for listing.
+   */
+  private async downloadDirectory(
+    sftp: SFTPWrapper,
+    remoteDir: string,
+    localDir: string,
+    name?: string,
+  ): Promise<string> {
+    const files: Array<{ remote: string; local: string }> = [];
+    const localDirs: string[] = [localDir];
+    let skipped = 0;
+    const key = name || this.defaultName;
+    const timeoutMs = this.getSftpTimeoutMs(this.getConfig(name));
+
+    const walk = async (remote: string, local: string): Promise<void> => {
+      const entries = await this.withTimeout(
+        this.readdirRemote(sftp, remote),
+        timeoutMs,
+        () => this.invalidateConnection(key),
+        `SFTP readdir timed out after ${timeoutMs}ms`,
+      );
+      for (const { filename, attrs } of entries) {
+        if (filename === "." || filename === "..") {
+          continue;
+        }
+        // 远端目录项只能是单个文件名，避免跨目录路径逃出下载目标。
+        if (!filename || /[\/\\\0]/.test(filename)) {
+          throw new ToolError(
+            "SFTP_ERROR",
+            `Invalid remote directory entry: ${JSON.stringify(filename)}`,
+            false,
+          );
+        }
+        const remoteChild = path.posix.join(remote, filename);
+        const localChild = path.join(local, filename);
+        if (attrs.isDirectory()) {
+          localDirs.push(localChild);
+          await walk(remoteChild, localChild);
+        } else if (attrs.isFile()) {
+          files.push({ remote: remoteChild, local: localChild });
+        } else {
+          skipped++;
+        }
+        if (files.length > MAX_DIRECTORY_TRANSFER_FILES) {
+          throw new ToolError(
+            "SFTP_ERROR",
+            `Directory has more than ${MAX_DIRECTORY_TRANSFER_FILES} files; archive it (tar) on the server and download the archive instead.`,
+            false,
+          );
+        }
+      }
+    };
+    await walk(remoteDir, localDir);
+
+    for (const dir of localDirs) {
+      // 按父子顺序逐个校验，现有符号链接不能将建目录操作引向白名单之外。
+      const validatedDir = this.validateLocalPath(dir, name, "write");
+      await fs.promises.mkdir(validatedDir, { recursive: true });
+    }
+    for (const file of files) {
+      try {
+        await this.download(file.remote, file.local, name);
+      } catch (error) {
+        throw new ToolError(
+          (error as ToolError).code ?? "SFTP_ERROR",
+          `Downloaded ${files.indexOf(file)} of ${files.length} files before failing on ${file.remote}: ${(error as Error).message}`,
+          (error as ToolError).retriable ?? true,
+        );
+      }
+    }
+    return `Directory downloaded: ${files.length} files to ${localDir}${
+      skipped ? ` (${skipped} non-regular entries such as symlinks skipped)` : ""
+    }`;
+  }
+
   private openSftp(client: Client): Promise<SFTPWrapper> {
     return new Promise<SFTPWrapper>((resolve, reject) => {
       client.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
@@ -657,6 +1227,138 @@ export class SSHConnectionManager {
         resolve(sftp);
       });
     });
+  }
+
+  private statRemote(
+    sftp: SFTPWrapper,
+    remotePath: string,
+  ): Promise<Stats> {
+    return new Promise<Stats>((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) =>
+        err ? reject(err) : resolve(stats),
+      );
+    });
+  }
+
+  /**
+   * Size to hand to the concurrent transfer path, or undefined to stay on the
+   * streaming path. Anything unexpected — a missing file, a directory, a
+   * server without stat support — falls back so the streaming path reports the
+   * same error it reports today.
+   */
+  private async getRemoteSizeForFastTransfer(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    timeoutMs: number,
+    key: string,
+  ): Promise<number | undefined> {
+    let stats: Stats;
+    try {
+      stats = await this.withTimeout(
+        this.statRemote(sftp, remotePath),
+        timeoutMs,
+        () => this.invalidateConnection(key),
+        `SFTP stat timed out after ${timeoutMs}ms`,
+      );
+    } catch (error) {
+      // A timeout already tore the connection down, so it has to surface.
+      if (error instanceof ToolError) {
+        throw error;
+      }
+      return undefined;
+    }
+
+    return stats.isFile() && stats.size >= SFTP_FAST_TRANSFER_MIN_BYTES
+      ? stats.size
+      : undefined;
+  }
+
+  private async getLocalSizeForFastTransfer(
+    localPath: string,
+  ): Promise<number | undefined> {
+    try {
+      const stats = await fs.promises.stat(localPath);
+      return stats.isFile() && stats.size >= SFTP_FAST_TRANSFER_MIN_BYTES
+        ? stats.size
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * fastGet transfers exactly the byte count the remote file had when it
+   * started, so data appended while it ran would be dropped. The streaming path
+   * reads until EOF and would have picked that tail up, so fetch it here to
+   * keep both paths equivalent for files that are still being written.
+   */
+  private async appendDownloadTail(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    tempLocalPath: string,
+    timeoutMs: number,
+    key: string,
+  ): Promise<void> {
+    const downloadedBytes = (await fs.promises.stat(tempLocalPath)).size;
+    const stats = await this.withTimeout(
+      this.statRemote(sftp, remotePath),
+      timeoutMs,
+      () => this.invalidateConnection(key),
+      `SFTP stat timed out after ${timeoutMs}ms`,
+    );
+
+    if (stats.size <= downloadedBytes) {
+      return;
+    }
+
+    await this.withTimeout(
+      pipeline(
+        sftp.createReadStream(remotePath, { start: downloadedBytes }),
+        fs.createWriteStream(tempLocalPath, { flags: "a" }),
+      ),
+      timeoutMs,
+      () => this.invalidateConnection(key),
+      `SFTP download timed out after ${timeoutMs}ms`,
+    );
+  }
+
+  /**
+   * Upload counterpart of appendDownloadTail. The local stat is free, so the
+   * remote round trip only happens when the local file actually grew.
+   */
+  private async appendUploadTail(
+    sftp: SFTPWrapper,
+    localPath: string,
+    remotePath: string,
+    sizeBeforeTransfer: number,
+    timeoutMs: number,
+    key: string,
+  ): Promise<void> {
+    const currentLocalSize = (await fs.promises.stat(localPath)).size;
+    if (currentLocalSize <= sizeBeforeTransfer) {
+      return;
+    }
+
+    const stats = await this.withTimeout(
+      this.statRemote(sftp, remotePath),
+      timeoutMs,
+      () => this.invalidateConnection(key),
+      `SFTP stat timed out after ${timeoutMs}ms`,
+    );
+
+    if (stats.size >= currentLocalSize) {
+      return;
+    }
+
+    await this.withTimeout(
+      pipeline(
+        fs.createReadStream(localPath, { start: stats.size }),
+        sftp.createWriteStream(remotePath, { flags: "a" }),
+      ),
+      timeoutMs,
+      () => this.invalidateConnection(key),
+      `SFTP upload timed out after ${timeoutMs}ms`,
+    );
   }
 
   private closeSftp(sftp: SFTPWrapper): void {
@@ -744,6 +1446,7 @@ export class SSHConnectionManager {
     this.shellReady.clear();
     this.shellQueues.clear();
     this.shellBuffers.clear();
+    this.shellDecoders.clear();
   }
 
   /**
@@ -772,6 +1475,7 @@ export class SSHConnectionManager {
   }
 
   private createClient(): Client {
+    const { Client } = require("ssh2") as typeof import("ssh2");
     return new Client();
   }
 
@@ -813,7 +1517,11 @@ export class SSHConnectionManager {
   }
 
   private getShellCommandTimeoutMs(config: SSHConfig): number {
-    return config.shellCommandTimeoutMs || 30000;
+    return config.shellCommandTimeoutMs || DEFAULT_COMMAND_TIMEOUT_MS;
+  }
+
+  private getCommandTimeoutMs(config: SSHConfig): number {
+    return config.commandTimeoutMs || DEFAULT_COMMAND_TIMEOUT_MS;
   }
 
   private getConnectionTimeoutMs(config: SSHConfig): number {
@@ -824,11 +1532,143 @@ export class SSHConnectionManager {
     return config.sftpTimeoutMs || DEFAULT_SFTP_TIMEOUT_MS;
   }
 
+  private getMaxOutputBytes(config: SSHConfig): number {
+    const configured = config.maxOutputBytes;
+    if (configured === undefined) {
+      return DEFAULT_MAX_OUTPUT_BYTES;
+    }
+    if (!Number.isSafeInteger(configured) || configured < 0) {
+      throw new ToolError(
+        "COMMAND_VALIDATION_FAILED",
+        `maxOutputBytes must be a non-negative integer, got: ${String(configured)}`,
+        false,
+      );
+    }
+    return configured;
+  }
+
+  private async createSocksProxySocket(
+    proxyUrl: URL,
+    config: SSHConfig,
+  ): Promise<Duplex> {
+    const { SocksClient } = require("socks") as typeof import("socks");
+    const proxyHost = normalizeUrlHostname(proxyUrl.hostname);
+    const proxyPort = parseProxyPort(proxyUrl);
+    if (!proxyHost) {
+      throw new Error("Proxy URL must include a host");
+    }
+
+    const proxy: {
+      host: string;
+      port: number;
+      type: 5;
+      userId?: string;
+      password?: string;
+    } = {
+      host: proxyHost,
+      port: proxyPort,
+      type: 5,
+    };
+
+    if (proxyUrl.username) {
+      proxy.userId = decodeURIComponent(proxyUrl.username);
+    }
+    if (proxyUrl.password) {
+      proxy.password = decodeURIComponent(proxyUrl.password);
+    }
+
+    const { socket } = await SocksClient.createConnection({
+      proxy,
+      command: "connect",
+      destination: {
+        host: config.host,
+        port: config.port,
+      },
+      timeout: this.getConnectionTimeoutMs(config),
+    });
+    return socket;
+  }
+
+  private createHttpProxySocket(
+    proxyUrl: URL,
+    config: SSHConfig,
+  ): Promise<Duplex> {
+    const isTlsProxy = proxyUrl.protocol === "https:";
+    const proxyHost = normalizeUrlHostname(proxyUrl.hostname);
+    const proxyPort = parseProxyPort(proxyUrl, isTlsProxy ? 443 : 80);
+    if (!proxyHost) {
+      throw new Error("Proxy URL must include a host");
+    }
+
+    const destination = formatHostPort(config.host, config.port);
+    const headers: Record<string, string> = { Host: destination };
+    if (proxyUrl.username || proxyUrl.password) {
+      const username = decodeURIComponent(proxyUrl.username);
+      const password = decodeURIComponent(proxyUrl.password);
+      headers["Proxy-Authorization"] = `Basic ${Buffer.from(
+        `${username}:${password}`,
+      ).toString("base64")}`;
+    }
+
+    return new Promise<Duplex>((resolve, reject) => {
+      const options = {
+        method: "CONNECT",
+        hostname: proxyHost,
+        port: proxyPort,
+        path: destination,
+        headers,
+      };
+      const proxyRequest = isTlsProxy
+        ? (require("node:https") as typeof import("node:https")).request(options)
+        : (require("node:http") as typeof import("node:http")).request(options);
+
+      proxyRequest.once("connect", (response, socket, head) => {
+        proxyRequest.setTimeout(0);
+        if (response.statusCode !== 200) {
+          socket.destroy();
+          reject(
+            new Error(
+              `HTTP proxy CONNECT failed with status ${response.statusCode ?? "unknown"}`,
+            ),
+          );
+          return;
+        }
+        if (head.length > 0) {
+          socket.unshift(head);
+        }
+        resolve(socket);
+      });
+      proxyRequest.once("error", reject);
+      proxyRequest.setTimeout(this.getConnectionTimeoutMs(config), () => {
+        proxyRequest.destroy(new Error("HTTP proxy CONNECT timed out"));
+      });
+      proxyRequest.end();
+    });
+  }
+
+  private async createProxySocket(
+    proxyUrl: URL,
+    config: SSHConfig,
+  ): Promise<Duplex> {
+    switch (proxyUrl.protocol) {
+      case "socks:":
+      case "socks5:":
+        return this.createSocksProxySocket(proxyUrl, config);
+      case "http:":
+      case "https:":
+        return this.createHttpProxySocket(proxyUrl, config);
+      default:
+        throw new Error(
+          `Unsupported proxy protocol '${proxyUrl.protocol}'. Use socks://, socks5://, http://, or https://`,
+        );
+    }
+  }
+
   private async buildClientConfig(
     key: string,
     config: SSHConfig,
-  ): Promise<Record<string, unknown>> {
-    const sshConfig: Record<string, unknown> = {
+  ): Promise<SshClientConfig> {
+    const sshConfig: SshClientConfig = {
       host: config.host,
       port: config.port,
       username: config.username,
@@ -839,55 +1679,38 @@ export class SSHConnectionManager {
       keepaliveCountMax:
         config.keepaliveCountMax || DEFAULT_KEEPALIVE_COUNT_MAX,
     };
+    if (config.algorithms) {
+      sshConfig.algorithms = config.algorithms;
+    }
 
-    if (config.socksProxy) {
+    if (config.proxy && config.socksProxy) {
+      throw new ToolError(
+        "SSH_CONNECTION_FAILED",
+        `Proxy configuration for [${key}] cannot use both 'proxy' and 'socksProxy'`,
+        false,
+      );
+    }
+
+    const proxyValue = config.proxy || config.socksProxy;
+    if (proxyValue) {
       try {
-        const proxyUrl = new URL(config.socksProxy);
-        const proxyHost = proxyUrl.hostname;
-        const proxyPort = Number.parseInt(proxyUrl.port, 10);
-
-        if (!proxyHost || !Number.isInteger(proxyPort) || proxyPort <= 0) {
+        const proxyUrl = new URL(proxyValue);
+        if (
+          config.socksProxy &&
+          proxyUrl.protocol !== "socks:" &&
+          proxyUrl.protocol !== "socks5:"
+        ) {
           throw new Error(
-            "SOCKS proxy URL must include a valid host and positive port",
+            "The legacy 'socksProxy' option only supports socks:// or socks5:// URLs; use 'proxy' for HTTP or HTTPS proxies",
           );
         }
-
-        const proxy: {
-          host: string;
-          port: number;
-          type: 5;
-          userId?: string;
-          password?: string;
-        } = {
-          host: proxyHost,
-          port: proxyPort,
-          type: 5,
-        };
-
-        if (proxyUrl.username) {
-          proxy.userId = decodeURIComponent(proxyUrl.username);
-        }
-        if (proxyUrl.password) {
-          proxy.password = decodeURIComponent(proxyUrl.password);
-        }
-
         Logger.log(
-          `Using SOCKS proxy for [${key}]: ${redactProxyUrl(proxyUrl)}`,
+          `Using proxy for [${key}]: ${redactProxyUrl(proxyUrl)}`,
           "info",
         );
-
-        const { socket } = await SocksClient.createConnection({
-          proxy,
-          command: "connect",
-          destination: {
-            host: config.host,
-            port: config.port,
-          },
-        });
-
-        sshConfig.sock = socket;
+        sshConfig.sock = await this.createProxySocket(proxyUrl, config);
         Logger.log(
-          `SSH config object with SOCKS proxy: ${JSON.stringify(
+          `SSH config object with proxy: ${JSON.stringify(
             sshConfig,
             (field, value) => (field === "sock" ? "[Socket object]" : value),
           )}`,
@@ -896,7 +1719,7 @@ export class SSHConnectionManager {
       } catch (error) {
         throw new ToolError(
           "SSH_CONNECTION_FAILED",
-          `Failed to create SOCKS proxy connection for [${key}]: ${
+          `Failed to create proxy connection for [${key}]: ${
             (error as Error).message
           }`,
           true,
@@ -972,7 +1795,7 @@ export class SSHConnectionManager {
         name: string,
         instructions: string,
         instructionsLang: string,
-        prompts: Array<{ prompt: string; echo: boolean }>,
+        prompts: Prompt[],
         finish: (responses: string[]) => void,
       ) => {
         Logger.log(
@@ -1095,8 +1918,12 @@ export class SSHConnectionManager {
     try {
       const status = await collectSystemStatus(
         (command, connectionName) =>
-          this.runCommandInternal(command, undefined, connectionName),
+          this.runCommandInternal(command, undefined, connectionName, {
+            prevalidatedInternalCommand: true,
+          }),
         key,
+        (command, connectionName) =>
+          this.validateCommand(command, connectionName).isAllowed,
       );
       this.statusCache.set(key, status);
       Logger.log(`System status collected for [${key}]`, "info");
@@ -1139,9 +1966,24 @@ export class SSHConnectionManager {
     const key = name || this.defaultName;
     const whitelistRegexes = this.commandWhitelistRegexes.get(key) || [];
     if (whitelistRegexes.length > 0) {
-      const matchesWhitelist = whitelistRegexes.some((regex) =>
-        regex.test(command),
-      );
+      // A whitelisted command is still executed by a remote shell. Do not let
+      // an allowed prefix authorize an appended command, pipeline, redirect,
+      // command substitution, background job, or newline-separated command.
+      // This is intentionally conservative: callers that need shell syntax
+      // should wrap it in a separately reviewed script and whitelist that
+      // script invocation instead.
+      if (/[;&|`<>\r\n]|\$\(/.test(command)) {
+        return {
+          isAllowed: false,
+          reason:
+            "Command contains shell control syntax forbidden by the whitelist",
+        };
+      }
+
+      const matchesWhitelist = whitelistRegexes.some((regex) => {
+        const match = regex.exec(command);
+        return match?.index === 0 && match[0] === command;
+      });
       if (!matchesWhitelist) {
         return {
           isAllowed: false,
@@ -1224,6 +2066,94 @@ export class SSHConnectionManager {
     ].join("\n");
   }
 
+  /**
+   * Format the output of a command that finished successfully.
+   *
+   * stderr is kept instead of being dropped: with `pty: false` a successful
+   * command's stderr is delivered on a separate channel, and discarding it
+   * silently loses warnings and progress output written there by tools such as
+   * git, docker and npm. With the default `pty: true` the remote end merges
+   * stderr into stdout, so `stderr` is empty here and the output is unchanged.
+   */
+  private formatCommandSuccess(stdout: string, stderr: string): string {
+    if (!stderr) {
+      return stdout;
+    }
+
+    return [stdout, `[stderr]\n${stderr}`].filter(Boolean).join("\n");
+  }
+
+  /**
+   * Start a command detached on the remote host. The user's command goes
+   * through the connection's whitelist/blacklist exactly like execute-command;
+   * only the fixed wrapper script is exempt.
+   */
+  public async jobStart(
+    cmdString: string,
+    directory?: string,
+    name?: string,
+  ): Promise<{ jobId: string; message: string }> {
+    const validation = this.validateCommand(cmdString, name);
+    if (!validation.isAllowed) {
+      throw new ToolError(
+        "COMMAND_VALIDATION_FAILED",
+        `Command validation failed: ${validation.reason}`,
+        false,
+      );
+    }
+    const jobId = generateJobId();
+    const message = await this.runJobScript(
+      buildJobStartScript(jobId, cmdString, directory),
+      name,
+    );
+    return { jobId, message };
+  }
+
+  public async jobStatus(
+    jobId: string,
+    options: { offset?: number; tailBytes?: number; maxBytes?: number },
+    name?: string,
+  ): Promise<string> {
+    this.assertJobId(jobId);
+    const maxBytes = options.maxBytes ?? DEFAULT_JOB_OUTPUT_BYTES;
+    return this.runJobScript(
+      buildJobStatusScript(jobId, {
+        offset: options.offset,
+        tailBytes: options.tailBytes ?? 8192,
+        maxBytes,
+      }),
+      name,
+    );
+  }
+
+  public async jobKill(jobId: string, name?: string): Promise<string> {
+    this.assertJobId(jobId);
+    return this.runJobScript(buildJobKillScript(jobId), name, 30000);
+  }
+
+  public async jobList(limit: number, name?: string): Promise<string> {
+    return this.runJobScript(buildJobListScript(limit), name);
+  }
+
+  private assertJobId(jobId: string): void {
+    try {
+      assertValidJobId(jobId);
+    } catch (error) {
+      throw new ToolError("UNKNOWN_ERROR", (error as Error).message, false);
+    }
+  }
+
+  private runJobScript(
+    script: string,
+    name?: string,
+    timeout: number = 20000,
+  ): Promise<string> {
+    return this.runCommandInternal(script, undefined, name, {
+      timeout,
+      prevalidatedInternalCommand: true,
+    });
+  }
+
   private async runCommandInternal(
     cmdString: string,
     directory?: string,
@@ -1232,13 +2162,15 @@ export class SSHConnectionManager {
   ): Promise<string> {
     const normalizedCommand = normalizeEol(cmdString);
 
-    const validationResult = this.validateCommand(normalizedCommand, name);
-    if (!validationResult.isAllowed) {
-      throw new ToolError(
-        "COMMAND_VALIDATION_FAILED",
-        `Command validation failed: ${validationResult.reason}`,
-        false,
-      );
+    if (!options.prevalidatedInternalCommand) {
+      const validationResult = this.validateCommand(normalizedCommand, name);
+      if (!validationResult.isAllowed) {
+        throw new ToolError(
+          "COMMAND_VALIDATION_FAILED",
+          `Command validation failed: ${validationResult.reason}`,
+          false,
+        );
+      }
     }
 
     const key = name || this.defaultName;
@@ -1248,7 +2180,7 @@ export class SSHConnectionManager {
       options.timeout ??
       (transportMode === "shell"
         ? this.getShellCommandTimeoutMs(config)
-        : 30000);
+        : this.getCommandTimeoutMs(config));
     const connectionTimeoutMs = this.getConnectionTimeoutMs(config);
     const client = await this.withTimeout(
       this.ensureConnected(name),
@@ -1286,6 +2218,8 @@ export class SSHConnectionManager {
     if (config.commandTemplate) {
       commandToRun = applyCommandTemplate(config.commandTemplate, commandToRun);
     }
+
+    const maxOutputBytes = this.getMaxOutputBytes(config);
 
     return new Promise<string>((resolve, reject) => {
       let openTimeoutId: NodeJS.Timeout | undefined;
@@ -1336,12 +2270,68 @@ export class SSHConnectionManager {
           let errorData = "";
           let exitCode: number | undefined;
           let exitSignal: string | undefined;
+          let capturedBytes = 0;
+          // Decoding each chunk on its own corrupts any multi-byte character
+          // that happens to be split across a chunk boundary.
+          const stdoutDecoder = new StringDecoder("utf8");
+          const stderrDecoder = new StringDecoder("utf8");
 
-          stream.on("data", (chunk: Buffer) => (data += chunk.toString()));
-          stream.stderr.on(
-            "data",
-            (chunk: Buffer) => (errorData += chunk.toString()),
-          );
+          // Without a cap a single command (`cat` on a huge file, an unbounded
+          // `journalctl`, ...) can buffer unbounded output in memory until the
+          // command timeout fires. Stop capturing and close the channel instead.
+          const appendChunk = (chunk: Buffer, isStderr: boolean) => {
+            if (settled) {
+              return;
+            }
+
+            if (
+              maxOutputBytes > 0 &&
+              capturedBytes + chunk.length > maxOutputBytes
+            ) {
+              const remaining = maxOutputBytes - capturedBytes;
+              if (remaining > 0) {
+                const partial = chunk.subarray(0, remaining);
+                if (isStderr) {
+                  errorData += stderrDecoder.write(partial);
+                } else {
+                  data += stdoutDecoder.write(partial);
+                }
+              }
+              capturedBytes = maxOutputBytes;
+              cleanup();
+              settled = true;
+              try {
+                stream.close();
+              } catch {
+                // Ignore close errors while aborting an oversized command.
+              }
+              const stdout = data.trimEnd();
+              const stderr = errorData.trimEnd();
+              reject(
+                new ToolError(
+                  "OUTPUT_LIMIT_EXCEEDED",
+                  [
+                    this.formatCommandSuccess(stdout, stderr),
+                    `[truncated] Output exceeded maxOutputBytes=${maxOutputBytes}; the command was aborted.`,
+                  ]
+                    .filter(Boolean)
+                    .join("\n"),
+                  false,
+                ),
+              );
+              return;
+            }
+
+            capturedBytes += chunk.length;
+            if (isStderr) {
+              errorData += stderrDecoder.write(chunk);
+            } else {
+              data += stdoutDecoder.write(chunk);
+            }
+          };
+
+          stream.on("data", (chunk: Buffer) => appendChunk(chunk, false));
+          stream.stderr.on("data", (chunk: Buffer) => appendChunk(chunk, true));
 
           stream.on(
             "exit",
@@ -1366,8 +2356,10 @@ export class SSHConnectionManager {
               exitSignal = signal;
             }
 
-            const stdout = data.trimEnd();
-            const stderr = errorData.trimEnd();
+            // Flush any trailing incomplete multi-byte sequence.
+            const stdout = (data + stdoutDecoder.end()).trimEnd();
+            const stderr = (errorData + stderrDecoder.end()).trimEnd();
+
             const hasNonZeroExitCode =
               exitCode !== undefined && exitCode !== 0;
             const hasExitSignal =
@@ -1391,12 +2383,13 @@ export class SSHConnectionManager {
                     commandToRun,
                   ),
                   false,
+                  true,
                 ),
               );
               return;
             }
 
-            resolve(stdout);
+            resolve(this.formatCommandSuccess(stdout, stderr));
           });
 
           stream.on("error", (streamError: Error) => {
@@ -1412,29 +2405,33 @@ export class SSHConnectionManager {
           });
 
           commandTimeoutId = setTimeout(() => {
+            if (settled) {
+              return;
+            }
+            // Settle before touching the channel: a channel that emits "close"
+            // synchronously must not turn the timeout into an empty success.
+            settled = true;
+            const stdout = data.trimEnd();
+            const stderr = errorData.trimEnd();
+
             try {
               stream.close();
             } catch {
               // Ignore stream close errors during timeout handling.
             }
 
-            if (!settled) {
-              settled = true;
-              const stdout = data.trimEnd();
-              const stderr = errorData.trimEnd();
-              reject(
-                new ToolError(
-                  "COMMAND_TIMEOUT",
-                  [
-                    this.formatCommandFailure(stdout, stderr),
-                    `[timeout] Command timed out after ${timeout}ms`,
-                  ]
-                    .filter(Boolean)
-                    .join("\n"),
-                  true,
-                ),
-              );
-            }
+            reject(
+              new ToolError(
+                "COMMAND_TIMEOUT",
+                [
+                  this.formatCommandFailure(stdout, stderr),
+                  `[timeout] Command timed out after ${timeout}ms`,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+                true,
+              ),
+            );
           }, timeout);
         },
       );
@@ -1483,6 +2480,7 @@ export class SSHConnectionManager {
     this.shellReady.set(key, false);
     this.shellQueues.set(key, Promise.resolve());
     this.shellBuffers.set(key, "");
+    this.shellDecoders.set(key, new StringDecoder("utf8"));
 
     const readyId = this.generateMarkerId("ready");
     const readyMarker = `__MCP_READY__${readyId}__`;
@@ -1494,7 +2492,7 @@ export class SSHConnectionManager {
         readyMarker,
         this.getShellReadyTimeoutMs(config),
       );
-      this.configureShellSession(stream);
+      await this.configureShellSession(key, stream, config);
       this.shellReady.set(key, true);
       this.attachShellLifecycleListeners(key, stream);
     } catch (error) {
@@ -1519,7 +2517,20 @@ export class SSHConnectionManager {
       let settled = false;
       let timeoutId: NodeJS.Timeout;
       let probeIntervalId: NodeJS.Timeout;
-      const payload = `printf '${readyMarker}\\n'\n`;
+      // Escape the marker in the probe payload so the command text does not
+      // contain the literal marker string.  When the PTY echoes the probe
+      // command back (echo is still on during the first probe), the echo no
+      // longer matches readyMarker, so resolveIfReady only fires once the
+      // printf actually executes and emits the literal marker.  Without this,
+      // waitForShellReady resolves on the echoed command line, before the
+      // probed command has run — which is fatal when the probed command is
+      // `stty -echo` in configureShellSession: the next real command would be
+      // sent before echo is disabled and would itself be echoed, leaving
+      // extractShellCommandResult matching markers inside the echoed script.
+      const escapedMarker = readyMarker
+        .replace(/\\/g, "\\\\")
+        .replace(/_/g, "\\137");
+      const payload = `printf '${escapedMarker}\\n'\n`;
 
       const cleanup = () => {
         if (timeoutId) {
@@ -1554,7 +2565,7 @@ export class SSHConnectionManager {
       };
 
       const onData = (chunk: Buffer) => {
-        this.appendShellBuffer(key, chunk.toString());
+        this.appendShellBuffer(key, chunk);
         resolveIfReady();
       };
 
@@ -1620,9 +2631,30 @@ export class SSHConnectionManager {
     );
   }
 
-  private configureShellSession(stream: ClientChannel): void {
+  private async configureShellSession(
+    key: string,
+    stream: ClientChannel,
+    config: SSHConfig,
+  ): Promise<void> {
+    // Send `export PS1=''` and `stty -echo` first.  The verification probe
+    // (printf, emitted by waitForShellReady below with an escaped marker)
+    // follows them in the same shell input stream, so by the time the
+    // probe's literal marker is emitted, stty has executed and terminal echo
+    // is off.  We must NOT write our own `printf '${marker}'` here: that
+    // payload contains the literal marker, so when echo is still on it would
+    // be echoed back and waitForShellReady would resolve prematurely, before
+    // stty runs — leaving the next real command echoed.
     stream.write("export PS1=''\n");
     stream.write("stty -echo >/dev/null 2>&1 || true\n");
+
+    const verifyId = this.generateMarkerId("stty");
+    const verifyMarker = `__MCP_CONFIGURE__${verifyId}__`;
+    await this.waitForShellReady(
+      key,
+      stream,
+      verifyMarker,
+      this.getShellReadyTimeoutMs(config),
+    );
   }
 
   private runShellCommand(
@@ -1672,9 +2704,20 @@ export class SSHConnectionManager {
     const config = this.getConfig(key);
     const script = this.buildShellCommandScript(commandId, cmdString, directory, config.commandTemplate);
 
+    const maxOutputBytes = this.getMaxOutputBytes(config);
+
     return new Promise<string>((resolve, reject) => {
       let settled = false;
       let timeoutId: NodeJS.Timeout;
+      const scanState: ShellScanState = {
+        outputStartIndex: -1,
+        tail: "",
+        // Whatever the previous command left behind cannot hold this command's
+        // markers, so the scan starts past it.
+        tailStart: (this.shellBuffers.get(key) || "").length,
+        countedOutputEndIndex: -1,
+        capturedOutputBytes: 0,
+      };
 
       const cleanup = () => {
         if (timeoutId) {
@@ -1701,8 +2744,30 @@ export class SSHConnectionManager {
       };
 
       const resolveIfComplete = () => {
-        const buffer = this.shellBuffers.get(key) || "";
-        const matched = this.extractShellCommandResult(buffer, commandId);
+        const matched = this.extractShellCommandResult(
+          key,
+          commandId,
+          scanState,
+        );
+
+        if (
+          maxOutputBytes > 0 &&
+          scanState.capturedOutputBytes > maxOutputBytes
+        ) {
+          // The shell channel is shared by every command on this connection,
+          // so it cannot simply be closed like an exec channel: the command
+          // would keep writing into the buffer. Drop the connection instead.
+          this.invalidateConnection(key);
+          finish(
+            new ToolError(
+              "OUTPUT_LIMIT_EXCEEDED",
+              `[truncated] Output exceeded maxOutputBytes=${maxOutputBytes}; the command was aborted.`,
+              false,
+            ),
+          );
+          return;
+        }
+
         if (!matched) {
           return;
         }
@@ -1724,6 +2789,7 @@ export class SSHConnectionManager {
                 cmdString,
               ),
               false,
+              true,
             ),
           );
           return;
@@ -1733,7 +2799,7 @@ export class SSHConnectionManager {
       };
 
       const onData = (chunk: Buffer) => {
-        this.appendShellBuffer(key, chunk.toString());
+        scanState.tail += this.appendShellBuffer(key, chunk);
         resolveIfComplete();
       };
 
@@ -1802,44 +2868,142 @@ export class SSHConnectionManager {
     ].join("\n");
   }
 
-  private extractShellCommandResult(
-    buffer: string,
-    commandId: string,
-  ): ShellCommandMatch | null {
-    const beginMarker = `__MCP_BEGIN__${commandId}__`;
-    const beginIndex = buffer.indexOf(beginMarker);
-    if (beginIndex === -1) {
-      return null;
-    }
-
-    const beginLineEndIndex = buffer.indexOf("\n", beginIndex);
-    if (beginLineEndIndex === -1) {
-      return null;
-    }
-
-    const outputStartIndex = beginLineEndIndex + 1;
-    const tail = buffer.slice(outputStartIndex);
-    const endRegex = new RegExp(
-      `__MCP_END__${this.escapeRegExp(commandId)}__RC__(-?\\d+)__(?:\\r)?\\n`,
+  /**
+   * Drop the part of the tail that can no longer start a marker: a marker only
+   * straddles the boundary of the chunk that just arrived, so keeping the last
+   * `markerLength - 1` characters is enough.
+   */
+  private trimShellScanTail(
+    scanState: ShellScanState,
+    markerLength: number,
+  ): void {
+    this.advanceShellScanTail(
+      scanState,
+      scanState.tail.length - Math.min(scanState.tail.length, markerLength - 1),
     );
-    const matched = endRegex.exec(tail);
-    if (!matched) {
+  }
+
+  private advanceShellScanTail(
+    scanState: ShellScanState,
+    offset: number,
+  ): void {
+    if (offset <= 0) {
+      return;
+    }
+    scanState.tailStart += offset;
+    scanState.tail = scanState.tail.slice(offset);
+  }
+
+  /**
+   * Locate a finished command, scanning only the freshly arrived tail. The
+   * accumulated buffer is read once, after the whole end marker is in hand.
+   */
+  private extractShellCommandResult(
+    key: string,
+    commandId: string,
+    scanState: ShellScanState,
+  ): ShellCommandMatch | null {
+    if (scanState.outputStartIndex === -1) {
+      const beginMarker = `__MCP_BEGIN__${commandId}__`;
+      const beginIndex = scanState.tail.indexOf(beginMarker);
+      if (beginIndex === -1) {
+        this.trimShellScanTail(scanState, beginMarker.length);
+        return null;
+      }
+
+      const beginLineEndIndex = scanState.tail.indexOf("\n", beginIndex);
+      if (beginLineEndIndex === -1) {
+        this.advanceShellScanTail(scanState, beginIndex);
+        return null;
+      }
+
+      this.advanceShellScanTail(scanState, beginLineEndIndex + 1);
+      scanState.outputStartIndex = scanState.tailStart;
+      scanState.countedOutputEndIndex = scanState.tailStart;
+    }
+
+    // Search the fixed prefix rather than the whole pattern: its length is
+    // known, which is what makes the retained overlap provably sufficient. The
+    // exit code is then parsed from the short slice that follows it.
+    const endPrefix = `__MCP_END__${commandId}__RC__`;
+    const endIndex = scanState.tail.indexOf(endPrefix);
+    if (endIndex === -1) {
+      // Keep the marker overlap plus CRLF immediately before it. The command
+      // wrapper emits that newline as framing, so it must not count against the
+      // user's output limit.
+      this.trimShellScanTail(scanState, endPrefix.length + 2);
+      this.countShellOutputThrough(key, scanState, scanState.tailStart);
       return null;
     }
 
-    const endIndex = outputStartIndex + matched.index;
-    const consumedEndIndex = endIndex + matched[0].length;
+    const absoluteEndIndex = scanState.tailStart + endIndex;
+    const buffer = this.shellBuffers.get(key) || "";
+    let outputEndIndex = absoluteEndIndex;
+    if (buffer[outputEndIndex - 1] === "\n") {
+      outputEndIndex -= 1;
+      if (buffer[outputEndIndex - 1] === "\r") {
+        outputEndIndex -= 1;
+      }
+    }
+    this.countShellOutputThrough(key, scanState, outputEndIndex);
+
+    const exitCodeStart = endIndex + endPrefix.length;
+    const matched = SHELL_EXIT_CODE_PATTERN.exec(
+      scanState.tail.slice(
+        exitCodeStart,
+        exitCodeStart + SHELL_EXIT_CODE_MAX_LENGTH,
+      ),
+    );
+    if (!matched) {
+      // The prefix arrived but the exit code has not; resume from here.
+      this.advanceShellScanTail(scanState, endIndex);
+      return null;
+    }
+
+    const consumedEndIndex =
+      absoluteEndIndex + endPrefix.length + matched[0].length;
 
     return {
-      output: buffer.slice(outputStartIndex, endIndex),
+      output: buffer.slice(scanState.outputStartIndex, absoluteEndIndex),
       exitCode: Number.parseInt(matched[1], 10),
       remainder: buffer.slice(consumedEndIndex),
     };
   }
 
-  private appendShellBuffer(key: string, chunk: string): void {
+  private countShellOutputThrough(
+    key: string,
+    scanState: ShellScanState,
+    endIndex: number,
+  ): void {
+    if (
+      scanState.outputStartIndex === -1 ||
+      endIndex <= scanState.countedOutputEndIndex
+    ) {
+      return;
+    }
+
+    const buffer = this.shellBuffers.get(key) || "";
+    scanState.capturedOutputBytes += Buffer.byteLength(
+      buffer.slice(scanState.countedOutputEndIndex, endIndex),
+      "utf8",
+    );
+    scanState.countedOutputEndIndex = endIndex;
+  }
+
+  /** Appends the decoded chunk and returns just that text. */
+  private appendShellBuffer(key: string, chunk: Buffer): string {
+    let decoder = this.shellDecoders.get(key);
+    if (!decoder) {
+      decoder = new StringDecoder("utf8");
+      this.shellDecoders.set(key, decoder);
+    }
+
+    // Concatenation alone stays cheap; it is reading the result that forces the
+    // rope to flatten, so nothing here may inspect the accumulated buffer.
+    const text = decoder.write(chunk);
     const current = this.shellBuffers.get(key) || "";
-    this.shellBuffers.set(key, current + chunk);
+    this.shellBuffers.set(key, current + text);
+    return text;
   }
 
   private cleanShellOutput(output: string): string {
@@ -1868,10 +3032,6 @@ export class SSHConnectionManager {
     return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
   }
 
-  private escapeRegExp(input: string): string {
-    return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
   private cleanupShellState(key: string, closeStream: boolean = false): void {
     const stream = this.shellStreams.get(key);
     if (closeStream && stream) {
@@ -1886,6 +3046,7 @@ export class SSHConnectionManager {
     this.shellReady.delete(key);
     this.shellQueues.delete(key);
     this.shellBuffers.delete(key);
+    this.shellDecoders.delete(key);
   }
 
   private clearConnectionState(key: string): void {

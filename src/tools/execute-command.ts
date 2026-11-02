@@ -274,6 +274,19 @@ export function registerExecuteCommandTool(server: McpServer): void {
         };
       } catch (error: unknown) {
         const toolError = toToolError(error, "UNKNOWN_ERROR");
+
+        // The command ran and ended with a non-zero status: its output ending in
+        // "[exit code] N" is the result, so return it as is instead of wrapping
+        // it in an escaped JSON error object. `grep` with no match or `diff` with
+        // differences are normal outcomes, not failures of this tool. Parse-failure
+        // hints appended by the manager (see appendParseFailureHint) travel in the
+        // same message.
+        if (toolError.commandRan) {
+          return {
+            content: [{ type: "text", text: toolError.message }],
+          };
+        }
+
         Logger.handleError(toolError, "Failed to execute command");
         return {
           content: [{

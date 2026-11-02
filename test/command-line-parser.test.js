@@ -4,13 +4,10 @@ import { CommandLineParser } from '../build/cli/command-line-parser.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 describe('Command Line Parser', () => {
   let originalArgv;
+  let fixturesDir;
   let testConfigPath;
   let testSshConfigPath;
 
@@ -18,10 +15,7 @@ describe('Command Line Parser', () => {
     originalArgv = process.argv;
 
     // 创建测试配置文件
-    const fixturesDir = path.join(__dirname, 'fixtures');
-    if (!fs.existsSync(fixturesDir)) {
-      fs.mkdirSync(fixturesDir, { recursive: true });
-    }
+    fixturesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-mcp-cli-test-'));
 
     testConfigPath = path.join(fixturesDir, 'test-config.json');
     testSshConfigPath = path.join(fixturesDir, 'test-ssh-config');
@@ -54,15 +48,7 @@ Host testhost
 
   after(() => {
     process.argv = originalArgv;
-
-    // 清理测试文件
-    try {
-      fs.unlinkSync(testConfigPath);
-      fs.unlinkSync(testSshConfigPath);
-      fs.rmdirSync(path.join(__dirname, 'fixtures'));
-    } catch (err) {
-      // 忽略清理错误
-    }
+    fs.rmSync(fixturesDir, { recursive: true, force: true });
   });
 
   describe('配置文件解析', () => {
@@ -77,7 +63,7 @@ Host testhost
     });
 
     it('应该正确解析 JSON 配置文件（数组格式）', () => {
-      const arrayConfigPath = path.join(__dirname, 'fixtures', 'array-config.json');
+      const arrayConfigPath = path.join(fixturesDir, 'array-config.json');
       fs.writeFileSync(arrayConfigPath, JSON.stringify([
         {
           name: 'server1',
@@ -105,6 +91,137 @@ Host testhost
       fs.unlinkSync(arrayConfigPath);
     });
 
+    it('应该保留 JSON 配置中的 SSH algorithms', () => {
+      const algorithmsConfigPath = path.join(fixturesDir, 'algorithms-config.json');
+      const algorithms = {
+        serverHostKey: { append: ['ssh-rsa'] },
+        hmac: ['hmac-sha1', 'hmac-md5']
+      };
+      fs.writeFileSync(algorithmsConfigPath, JSON.stringify({
+        legacy: {
+          host: '192.168.1.100',
+          port: 22,
+          username: 'legacy-user',
+          password: 'legacy-pass',
+          algorithms
+        }
+      }));
+
+      try {
+        process.argv = ['node', 'test', '--config-file', algorithmsConfigPath];
+        const result = CommandLineParser.parseArgs();
+
+        assert.deepStrictEqual(result.configs.legacy.algorithms, algorithms);
+      } finally {
+        fs.unlinkSync(algorithmsConfigPath);
+      }
+    });
+
+    it('应该保留并校验 JSON 配置中的 maxOutputBytes', () => {
+      const outputLimitConfigPath = path.join(fixturesDir, 'output-limit-config.json');
+      fs.writeFileSync(outputLimitConfigPath, JSON.stringify({
+        limited: {
+          host: '192.168.1.100',
+          port: 22,
+          username: 'limited-user',
+          password: 'limited-pass',
+          maxOutputBytes: 2048
+        },
+        unlimited: {
+          host: '192.168.1.101',
+          port: 22,
+          username: 'unlimited-user',
+          password: 'unlimited-pass',
+          maxOutputBytes: 0
+        }
+      }));
+
+      try {
+        process.argv = ['node', 'test', '--config-file', outputLimitConfigPath];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.limited.maxOutputBytes, 2048);
+        assert.strictEqual(result.configs.unlimited.maxOutputBytes, 0);
+      } finally {
+        fs.unlinkSync(outputLimitConfigPath);
+      }
+    });
+
+    it('应从配置文件解析 commandTimeoutMs', () => {
+      const timeoutConfigPath = path.join(fixturesDir, 'command-timeout-config.json');
+      fs.writeFileSync(timeoutConfigPath, JSON.stringify({
+        slow: {
+          host: '192.168.1.100',
+          port: 22,
+          username: 'slow-user',
+          password: 'slow-pass',
+          commandTimeoutMs: 180000
+        },
+        plain: {
+          host: '192.168.1.101',
+          port: 22,
+          username: 'plain-user',
+          password: 'plain-pass'
+        }
+      }));
+
+      try {
+        process.argv = ['node', 'test', '--config-file', timeoutConfigPath];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.slow.commandTimeoutMs, 180000);
+        assert.strictEqual(result.configs.plain.commandTimeoutMs, undefined);
+      } finally {
+        fs.unlinkSync(timeoutConfigPath);
+      }
+    });
+
+    it('无效的 commandTimeoutMs 应抛出错误', () => {
+      const invalidTimeoutPath = path.join(fixturesDir, 'invalid-command-timeout-config.json');
+      fs.writeFileSync(invalidTimeoutPath, JSON.stringify({
+        invalid: {
+          host: '192.168.1.100',
+          port: 22,
+          username: 'invalid-user',
+          password: 'invalid-pass',
+          commandTimeoutMs: 0
+        }
+      }));
+
+      try {
+        process.argv = ['node', 'test', '--config-file', invalidTimeoutPath];
+        assert.throws(
+          () => CommandLineParser.parseArgs(),
+          /commandTimeoutMs must be a positive number/,
+        );
+      } finally {
+        fs.unlinkSync(invalidTimeoutPath);
+      }
+    });
+
+    it('无效的 maxOutputBytes 应抛出错误', () => {
+      const invalidConfigPath = path.join(fixturesDir, 'invalid-output-limit-config.json');
+      fs.writeFileSync(invalidConfigPath, JSON.stringify({
+        invalid: {
+          host: '192.168.1.100',
+          port: 22,
+          username: 'invalid-user',
+          password: 'invalid-pass',
+          maxOutputBytes: -1
+        }
+      }));
+
+      try {
+        process.argv = ['node', 'test', '--config-file', invalidConfigPath];
+        assert.throws(
+          () => CommandLineParser.parseArgs(),
+          /maxOutputBytes must be a non-negative integer/,
+        );
+      } finally {
+        fs.unlinkSync(invalidConfigPath);
+      }
+    });
+
     it('配置文件不存在时应抛出错误', () => {
       process.argv = ['node', 'test', '--config-file', '/nonexistent/config.json'];
       assert.throws(() => {
@@ -122,7 +239,8 @@ Host testhost
         username: 'testuser',
         password: 'testpass',
         transportMode: 'shell',
-        shellReadyTimeoutMs: 15000
+        shellReadyTimeoutMs: 15000,
+        maxOutputBytes: 0
       });
 
       process.argv = ['node', 'test', '--ssh', sshJson];
@@ -132,6 +250,7 @@ Host testhost
       assert.strictEqual(result.configs.test.username, 'testuser');
       assert.strictEqual(result.configs.test.transportMode, 'shell');
       assert.strictEqual(result.configs.test.shellReadyTimeoutMs, 15000);
+      assert.strictEqual(result.configs.test.maxOutputBytes, 0);
     });
 
     it('应该正确解析旧格式的 --ssh 参数', () => {
@@ -184,6 +303,44 @@ Host testhost
       assert.strictEqual(result.configs.default.password, undefined);
     });
 
+    it('显式 password 存在时不应注入环境 SSH agent', () => {
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      process.env.SSH_AUTH_SOCK = '/tmp/environment-agent.sock';
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--username', 'testuser', '--password', 'testpass'];
+
+      try {
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.default.password, 'testpass');
+        assert.strictEqual(result.configs.default.agent, undefined);
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+      }
+    });
+
+    it('显式 privateKey 存在时不应注入环境 SSH agent', () => {
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      process.env.SSH_AUTH_SOCK = '/tmp/environment-agent.sock';
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--username', 'testuser', '--privateKey', '~/.ssh/id_rsa'];
+
+      try {
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.default.privateKey, path.join(os.homedir(), '.ssh', 'id_rsa'));
+        assert.strictEqual(result.configs.default.agent, undefined);
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+      }
+    });
+
     it('缺少必需参数时应抛出错误', () => {
       process.argv = ['node', 'test', '--host', '1.2.3.4'];
       assert.throws(() => {
@@ -193,6 +350,56 @@ Host testhost
   });
 
   describe('SSH Config 集成', () => {
+    it('SSH config 缺少 Port 和 IdentityFile 时应使用默认端口和 SSH agent', () => {
+      const minimalSshConfigPath = path.join(fixturesDir, 'minimal-ssh-config');
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      fs.writeFileSync(minimalSshConfigPath, `
+Host minimalhost
+    HostName 172.16.0.2
+    User minimaluser
+`);
+      process.env.SSH_AUTH_SOCK = '/tmp/test-ssh-agent.sock';
+      process.argv = ['node', 'test', '--host', 'minimalhost', '--ssh-config-file', minimalSshConfigPath];
+
+      try {
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.default.host, '172.16.0.2');
+        assert.strictEqual(result.configs.default.port, 22);
+        assert.strictEqual(result.configs.default.username, 'minimaluser');
+        assert.strictEqual(result.configs.default.agent, '/tmp/test-ssh-agent.sock');
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+        fs.unlinkSync(minimalSshConfigPath);
+      }
+    });
+
+    it('命令行 port 和 agent 应覆盖 SSH config 默认值', () => {
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      process.env.SSH_AUTH_SOCK = '/tmp/environment-agent.sock';
+
+      try {
+        process.argv = [
+          'node', 'test', '--host', 'testhost', '--port', '3333', '--agent', '/tmp/explicit-agent.sock',
+          '--ssh-config-file', testSshConfigPath,
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.default.port, 3333);
+        assert.strictEqual(result.configs.default.agent, '/tmp/explicit-agent.sock');
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+      }
+    });
+
     it('应该从 SSH config 读取连接参数', () => {
       process.argv = ['node', 'test', '--host', 'testhost', '--ssh-config-file', testSshConfigPath];
       const result = CommandLineParser.parseArgs();
@@ -200,7 +407,9 @@ Host testhost
       assert.strictEqual(result.configs.default.host, '172.16.0.1');
       assert.strictEqual(result.configs.default.port, 2222);
       assert.strictEqual(result.configs.default.username, 'testuser');
-      assert.ok(result.configs.default.privateKey.includes('.ssh/test_key'));
+      assert.ok(
+        result.configs.default.privateKey.endsWith(path.join('.ssh', 'test_key')),
+      );
     });
 
     it('命令行参数应覆盖 SSH config 值', () => {
@@ -218,6 +427,194 @@ Host testhost
 
       assert.strictEqual(result.configs.default.password, 'mypass');
       assert.strictEqual(result.configs.default.host, '172.16.0.1');
+    });
+  });
+
+  describe('--host 多值多连接模式', () => {
+    const multiSshConfigPath = () => path.join(fixturesDir, 'multi-hosts-ssh-config');
+    const writeMultiConfig = () => {
+      fs.writeFileSync(multiSshConfigPath(), `
+Host hosta
+    HostName 172.16.0.10
+    Port 2222
+    User usera
+    IdentityFile ~/.ssh/key_a
+
+Host hostb
+    HostName 172.16.0.11
+    User userb
+`);
+      return multiSshConfigPath();
+    };
+
+    it('多个别名应各自独立展开为多连接，连接名为别名本身', () => {
+      const configPath = writeMultiConfig();
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      process.env.SSH_AUTH_SOCK = '/tmp/test-ssh-agent.sock';
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--host', 'hosta,hostb',
+          '--ssh-config-file', configPath,
+          '--pty', 'false',
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(Object.keys(result.configs).length, 2);
+
+        assert.strictEqual(result.configs.hosta.name, 'hosta');
+        assert.strictEqual(result.configs.hosta.host, '172.16.0.10');
+        assert.strictEqual(result.configs.hosta.port, 2222);
+        assert.strictEqual(result.configs.hosta.username, 'usera');
+        assert.ok(result.configs.hosta.privateKey.endsWith(path.join('.ssh', 'key_a')));
+        assert.strictEqual(result.configs.hosta.pty, false);
+
+        // hostb 无 IdentityFile：默认端口 22，认证回退顺序为默认身份
+        // 文件 > agent（与单主机模式一致）；测试机可能存在真实默认密钥，
+        // 两种回退结果都合法
+        assert.strictEqual(result.configs.hostb.host, '172.16.0.11');
+        assert.strictEqual(result.configs.hostb.port, 22);
+        assert.strictEqual(result.configs.hostb.username, 'userb');
+        const hostbAuth =
+          result.configs.hostb.privateKey || result.configs.hostb.agent;
+        assert.ok(
+          hostbAuth,
+          'hostb 应回退到默认身份文件或 SSH agent 之一',
+        );
+        assert.strictEqual(result.configs.hostb.pty, false);
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('提供 CLI 认证参数时全部主机共享认证，IdentityFile 不参与', () => {
+      const configPath = writeMultiConfig();
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--host', 'hosta,10.99.0.1',
+          '--username', 'shareduser',
+          '--password', 'sharedpass',
+          '--ssh-config-file', configPath,
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(Object.keys(result.configs).length, 2);
+
+        // hosta 命中 config：地址仍展开，但认证用 CLI 共享值
+        assert.strictEqual(result.configs.hosta.host, '172.16.0.10');
+        assert.strictEqual(result.configs.hosta.username, 'shareduser');
+        assert.strictEqual(result.configs.hosta.password, 'sharedpass');
+        assert.strictEqual(result.configs.hosta.privateKey, undefined);
+
+        // 裸 IP 原样作为地址，同样共享 CLI 认证
+        assert.strictEqual(result.configs['10.99.0.1'].host, '10.99.0.1');
+        assert.strictEqual(result.configs['10.99.0.1'].username, 'shareduser');
+        assert.strictEqual(result.configs['10.99.0.1'].password, 'sharedpass');
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('CLI port/username 应逐字段覆盖全部主机', () => {
+      const configPath = writeMultiConfig();
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--host', 'hosta,hostb',
+          '--port', '3333',
+          '--username', 'overrideuser',
+          '--password', 'pass',
+          '--ssh-config-file', configPath,
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.strictEqual(result.configs.hosta.port, 3333);
+        assert.strictEqual(result.configs.hosta.username, 'overrideuser');
+        assert.strictEqual(result.configs.hostb.port, 3333);
+        assert.strictEqual(result.configs.hostb.username, 'overrideuser');
+        // HostName 仍来自 config
+        assert.strictEqual(result.configs.hosta.host, '172.16.0.10');
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('主机缺用户名或认证来源时应报错并列出该主机', () => {
+      const configPath = writeMultiConfig();
+      const originalSshAuthSock = process.env.SSH_AUTH_SOCK;
+      delete process.env.SSH_AUTH_SOCK;
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--host', 'hosta,ghosthost',
+          '--ssh-config-file', configPath,
+        ];
+        // ghosthost 未命中 config 且无 CLI 认证 → 报错列出
+        // （hosta 命中且有 IdentityFile 不受影响）
+        assert.throws(
+          () => CommandLineParser.parseArgs(),
+          /Missing required parameters for host\(s\): ghosthost/,
+        );
+      } finally {
+        if (originalSshAuthSock === undefined) {
+          delete process.env.SSH_AUTH_SOCK;
+        } else {
+          process.env.SSH_AUTH_SOCK = originalSshAuthSock;
+        }
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('多值应去重且忽略空项', () => {
+      const configPath = writeMultiConfig();
+
+      try {
+        process.argv = [
+          'node', 'test',
+          '--host', 'hosta,hosta, ,hosta',
+          '--username', 'u',
+          '--password', 'p',
+          '--ssh-config-file', configPath,
+        ];
+        const result = CommandLineParser.parseArgs();
+
+        assert.deepStrictEqual(Object.keys(result.configs), ['hosta']);
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('空项过滤后只剩一个别名时仍应正确展开', () => {
+      const configPath = writeMultiConfig();
+      try {
+        for (const host of ['hosta,', ', hosta ,', ' hosta ']) {
+          process.argv = ['node', 'test', '--host', host, '--username', 'u', '--password', 'p', '--ssh-config-file', configPath];
+          const result = CommandLineParser.parseArgs();
+          assert.strictEqual(result.configs.default.host, '172.16.0.10');
+          assert.strictEqual(result.configs.default.port, 2222);
+        }
+      } finally {
+        fs.rmSync(configPath, { force: true });
+      }
+    });
+
+    it('单值含逗号以外的行为保持不变：连接名仍为 default', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass'];
+      const result = CommandLineParser.parseArgs();
+
+      assert.strictEqual(Object.keys(result.configs).length, 1);
+      assert.ok(result.configs.default);
+      assert.strictEqual(result.configs.default.host, '1.2.3.4');
     });
   });
 
@@ -263,15 +660,22 @@ Host testhost
       assert.strictEqual(result.configs.default.shellReadyTimeoutMs, 15000);
     });
 
-    it('应该正确解析 --pty 选项', () => {
-      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--pty'];
+    it('应该正确解析 --pty true 选项', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--pty', 'true'];
       const result = CommandLineParser.parseArgs();
 
       assert.strictEqual(result.configs.default.pty, true);
     });
 
+    it('应该正确解析 --pty false 选项', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--pty', 'false'];
+      const result = CommandLineParser.parseArgs();
+
+      assert.strictEqual(result.configs.default.pty, false);
+    });
+
     it('应该正确解析配置文件中的字符串 false pty', () => {
-      const ptyConfigPath = path.join(__dirname, 'fixtures', 'pty-config.json');
+      const ptyConfigPath = path.join(fixturesDir, 'pty-config.json');
       fs.writeFileSync(ptyConfigPath, JSON.stringify({
         dev: {
           host: '192.168.1.100',
@@ -304,13 +708,20 @@ Host testhost
       assert.strictEqual(result.configs.default.socksProxy, 'socks://proxy:1080');
     });
 
+    it('应该正确解析通用代理', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--proxy', 'http://proxy:8080'];
+      const result = CommandLineParser.parseArgs();
+
+      assert.strictEqual(result.configs.default.proxy, 'http://proxy:8080');
+    });
+
     it('应该正确解析 allowed local paths', () => {
       process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--allowed-local-paths', './tmp,~/.ssh'];
       const result = CommandLineParser.parseArgs();
 
       assert.ok(Array.isArray(result.configs.default.allowedLocalPaths));
       assert.strictEqual(result.configs.default.allowedLocalPaths.length, 2);
-      assert.ok(result.configs.default.allowedLocalPaths.every((entry) => entry.startsWith('/')));
+      assert.ok(result.configs.default.allowedLocalPaths.every((entry) => path.isAbsolute(entry)));
       assert.strictEqual(result.configs.default.allowedLocalPaths[1], path.join(os.homedir(), '.ssh'));
     });
 
@@ -329,8 +740,25 @@ Host testhost
       assert.throws(() => CommandLineParser.parseArgs(), /absolute POSIX/);
     });
 
+    it('应该正确解析 Windows 风格的 allowed remote paths', () => {
+      process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--allowed-remote-paths', 'C:\\Users\\ops,D:/data/,c:/temp'];
+      const result = CommandLineParser.parseArgs();
+
+      assert.deepStrictEqual(
+        result.configs.default.allowedRemotePaths,
+        ['C:/Users/ops', 'D:/data', 'c:/temp']
+      );
+    });
+
+    it('非法的 allowedRemotePaths 条目应抛出错误', () => {
+      for (const badEntry of ['C:', 'C:relative\\dir', '\\Users\\ops', '\\\\server\\share']) {
+        process.argv = ['node', 'test', '--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass', '--allowed-remote-paths', badEntry];
+        assert.throws(() => CommandLineParser.parseArgs(), /absolute POSIX/);
+      }
+    });
+
     it('应该正确解析配置文件中的 commandTemplate', () => {
-      const templateConfigPath = path.join(__dirname, 'fixtures', 'template-config.json');
+      const templateConfigPath = path.join(fixturesDir, 'template-config.json');
       fs.writeFileSync(templateConfigPath, JSON.stringify({
         dev: {
           host: '192.168.1.100',
@@ -350,7 +778,7 @@ Host testhost
     });
 
     it('应该支持 commandTemplate 的 <quotedCommand> 占位符', () => {
-      const templateConfigPath = path.join(__dirname, 'fixtures', 'quoted-template-config.json');
+      const templateConfigPath = path.join(fixturesDir, 'quoted-template-config.json');
       fs.writeFileSync(templateConfigPath, JSON.stringify({
         dev: {
           host: '192.168.1.100',
@@ -370,7 +798,7 @@ Host testhost
     });
 
     it('commandTemplate 缺少 <command> 占位符时应抛出错误', () => {
-      const badConfigPath = path.join(__dirname, 'fixtures', 'bad-template-config.json');
+      const badConfigPath = path.join(fixturesDir, 'bad-template-config.json');
       fs.writeFileSync(badConfigPath, JSON.stringify({
         dev: {
           host: '192.168.1.100',
@@ -408,6 +836,87 @@ Host testhost
 
       assert.strictEqual(Object.keys(result.configs).length, 1);
       assert.strictEqual(result.configs.test.host, '1.1.1.1');
+    });
+  });
+
+  describe('MCP HTTP 传输参数', () => {
+    const sshArgs = ['--host', '1.2.3.4', '--port', '22', '--username', 'user', '--password', 'pass'];
+
+    it('默认使用 stdio，并给出本机 HTTP 监听默认值', () => {
+      process.argv = ['node', 'test', ...sshArgs];
+      const result = CommandLineParser.parseArgs();
+
+      assert.strictEqual(result.mcpTransport, 'stdio');
+      assert.strictEqual(result.http.host, '127.0.0.1');
+      assert.strictEqual(result.http.port, 3000);
+      assert.strictEqual(result.http.path, '/mcp');
+      assert.strictEqual(result.http.token, process.env.SSH_MCP_HTTP_TOKEN || undefined);
+    });
+
+    it('应该解析 HTTP 监听参数', () => {
+      process.argv = [
+        'node', 'test', ...sshArgs,
+        '--mcp-transport', 'http',
+        '--http-host', '0.0.0.0',
+        '--http-port', '0',
+        '--http-path', '/ssh/',
+        '--http-token', 'cli-token',
+      ];
+      const result = CommandLineParser.parseArgs();
+
+      assert.strictEqual(result.mcpTransport, 'http');
+      assert.deepStrictEqual(result.http, {
+        host: '0.0.0.0',
+        port: 0,
+        path: '/ssh',
+        token: 'cli-token',
+      });
+    });
+
+    it('命令行令牌应覆盖 SSH_MCP_HTTP_TOKEN', () => {
+      const previous = process.env.SSH_MCP_HTTP_TOKEN;
+      process.env.SSH_MCP_HTTP_TOKEN = 'env-token';
+      try {
+        process.argv = ['node', 'test', ...sshArgs, '--http-token', 'cli-token'];
+        const result = CommandLineParser.parseArgs();
+        assert.strictEqual(result.http.token, 'cli-token');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.SSH_MCP_HTTP_TOKEN;
+        } else {
+          process.env.SSH_MCP_HTTP_TOKEN = previous;
+        }
+      }
+    });
+
+    it('未提供命令行令牌时应读取 SSH_MCP_HTTP_TOKEN', () => {
+      const previous = process.env.SSH_MCP_HTTP_TOKEN;
+      process.env.SSH_MCP_HTTP_TOKEN = 'env-token';
+      try {
+        process.argv = ['node', 'test', ...sshArgs];
+        const result = CommandLineParser.parseArgs();
+        assert.strictEqual(result.http.token, 'env-token');
+      } finally {
+        if (previous === undefined) {
+          delete process.env.SSH_MCP_HTTP_TOKEN;
+        } else {
+          process.env.SSH_MCP_HTTP_TOKEN = previous;
+        }
+      }
+    });
+
+    it('非法传输、端口和路径应抛出错误', () => {
+      process.argv = ['node', 'test', ...sshArgs, '--mcp-transport', 'sse'];
+      assert.throws(() => CommandLineParser.parseArgs(), /stdio/);
+
+      process.argv = ['node', 'test', ...sshArgs, '--http-port', '70000'];
+      assert.throws(() => CommandLineParser.parseArgs(), /65535/);
+
+      process.argv = ['node', 'test', ...sshArgs, '--http-path', 'mcp'];
+      assert.throws(() => CommandLineParser.parseArgs(), /absolute path/);
+
+      process.argv = ['node', 'test', ...sshArgs, '--http-host', 'http://127.0.0.1'];
+      assert.throws(() => CommandLineParser.parseArgs(), /hostname or IP/);
     });
   });
 });

@@ -1,0 +1,754 @@
+<div align="center">
+
+<img src="images/ssh-mcp-server-logo-v2.png" alt="ssh-mcp-server logo" width="220">
+
+# ssh-mcp-server
+
+![NPM Version](https://img.shields.io/npm/v/%40fangjunjie%2Fssh-mcp-server?label=%40fangjunjie%2Fssh-mcp-server)
+![GitHub forks](https://img.shields.io/github/forks/classfang/ssh-mcp-server)
+![GitHub Repo stars](https://img.shields.io/github/stars/classfang/ssh-mcp-server)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues/classfang/ssh-mcp-server)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-closed/classfang/ssh-mcp-server)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr/classfang/ssh-mcp-server)
+![GitHub Issues or Pull Requests](https://img.shields.io/github/issues-pr-closed/classfang/ssh-mcp-server)
+
+SSH-based MCP (Model Context Protocol) server that allows remote execution of SSH commands via the MCP protocol.
+
+English Document | [中文文档](README.md)
+
+</div>
+
+## 📝 Project Overview
+
+ssh-mcp-server is a bridging tool that enables AI assistants and other applications supporting the MCP protocol to execute remote SSH commands through a standardized interface. This allows AI assistants to safely operate remote servers, execute commands, and retrieve results without directly exposing SSH credentials to AI models.
+
+## ✨ Key Features
+
+- **🔒 Secure Connections**: Supports multiple secure SSH connection methods, including password authentication and private key authentication (with passphrase support)
+- **🛡️ Command Security Control**: Precisely control the range of allowed commands through flexible blacklist and whitelist mechanisms to prevent dangerous operations
+- **🔄 Standardized Interface**: Complies with MCP protocol specifications for seamless integration with AI assistants supporting the protocol
+- **🚇 Dual Transport Modes**: Supports both `exec` and `shell` transport modes for direct SSH hosts and bastion or jump-host scenarios
+- **🌐 HTTP Access**: Uses stdio by default; `--mcp-transport http` serves the MCP endpoint over Streamable HTTP
+- **📂 File Transfer**: Supports bidirectional file transfers, uploading local files to servers or downloading files from servers
+- **🔑 Credential Isolation**: SSH credentials are managed entirely locally and never exposed to AI models, enhancing security
+- **🚀 Ready to Use**: Can be run directly using NPX without global installation, making it convenient and quick to deploy
+
+## 📦 Open Source Repository
+
+GitHub: [https://github.com/classfang/ssh-mcp-server](https://github.com/classfang/ssh-mcp-server)
+
+NPM: [https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server](https://www.npmjs.com/package/@fangjunjie/ssh-mcp-server)
+
+## 🛠️ Tools List
+
+| Tool | Name | Description |
+|---------|-----------|----------|
+| execute-command | Command Execution Tool | Execute SSH commands on remote servers and get results |
+| upload | File Upload Tool | Upload local files or whole directories to specified locations on remote servers |
+| download | File Download Tool | Download files or whole directories from remote servers to local specified locations |
+| read-file | File Read Tool | Read a remote text file over SFTP, pageable by byte offset; refuses binary files |
+| write-file | File Write Tool | Write text content to a remote file over SFTP (overwrite or append), bypassing shell quoting |
+| list-servers | List Servers Tool | List all available SSH server configurations |
+| job-start / job-status / job-kill / job-list | Background Job Tools | Start tasks that outlive the command timeout, poll their output and exit code, kill them |
+
+## 📚 Usage
+
+### 0. 🤖 Quick Setup via AI Skill (Recommended)
+
+If you are using an AI coding assistant that supports skills (such as Claude Code), you can use the built-in **ssh-mcp-helper** skill to complete the installation and configuration interactively — no need to manually edit JSON files.
+
+**How to use:**
+
+1. Install the skill from this repository's `skills/` directory
+2. Tell your AI assistant: "Help me set up ssh-mcp-server" or "Configure SSH MCP for my remote server"
+3. The skill will guide you step by step: check Node.js environment → choose MCP client → select authentication method → collect connection parameters → generate and write configuration
+
+The skill supports all scenarios covered below (password, private key, SSH config reuse, SOCKS proxy, bastion hosts, multi-connection, 2FA, command restrictions, etc.) and automatically produces correctly formatted configuration.
+
+---
+
+The sections below are arranged from the simplest entry point (username + password) to more advanced scenarios. Pick the case that matches yours and copy the `mcp.json` snippet directly into your MCP client configuration.
+
+> **⚠️ Important**: In MCP configuration files, each command line argument and its value must be separate elements in the `args` array. Do NOT combine them with spaces. For example, use `"--host", "192.168.1.1"` instead of `"--host 192.168.1.1"`.
+
+### 1. 🔑 Username + Password (simplest)
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "192.168.1.1",
+        "--port", "22",
+        "--username", "root",
+        "--password", "pwd123456"
+      ]
+    }
+  }
+}
+```
+
+### 2. 🔐 Username + Private Key
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "192.168.1.1",
+        "--port", "22",
+        "--username", "root",
+        "--privateKey", "~/.ssh/id_rsa"
+      ]
+    }
+  }
+}
+```
+
+### 3. 🔏 Private Key with Passphrase
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "192.168.1.1",
+        "--port", "22",
+        "--username", "root",
+        "--privateKey", "~/.ssh/id_rsa",
+        "--passphrase", "pwd123456"
+      ]
+    }
+  }
+}
+```
+
+### 4. 📋 Reuse `~/.ssh/config`
+
+If you already have a host alias in `~/.ssh/config`, the server reads connection parameters directly from it — no need to repeat them in `mcp.json`.
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "myserver"
+      ]
+    }
+  }
+}
+```
+
+Assuming your `~/.ssh/config` contains:
+
+```
+Host myserver
+    HostName 192.168.1.1
+    Port 22
+    User root
+    IdentityFile ~/.ssh/id_rsa
+```
+
+You can also specify a custom SSH config file path:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "myserver",
+        "--ssh-config-file", "/path/to/custom/ssh_config"
+      ]
+    }
+  }
+}
+```
+
+**Note**: Command-line parameters take precedence over SSH config values. For example, if you specify `--port 2222`, it will override the port from SSH config.
+
+To connect to multiple hosts that are already defined in your SSH config in one shot, see Method 4 under "10. Managing Multiple SSH Connections" below.
+
+### 5. 🌐 Connecting Through a Proxy
+
+When the target host is only reachable through a proxy, use `--proxy` with a SOCKS5, HTTP, or HTTPS proxy.
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "192.168.1.1",
+        "--port", "22",
+        "--username", "root",
+        "--password", "pwd123456",
+        "--proxy", "http://username:password@proxy-host:proxy-port"
+      ]
+    }
+  }
+}
+```
+
+Supported URL formats:
+
+```text
+socks://username:password@proxy-host:1080
+socks5://username:password@proxy-host:1080
+http://username:password@proxy-host:8080
+https://username:password@proxy-host:8443
+```
+
+HTTP and HTTPS proxies use the `CONNECT` method to tunnel to the SSH server, with optional Basic proxy authentication. HTTP and HTTPS default to ports `80` and `443`; SOCKS5 requires an explicit port. HTTPS proxy certificates are verified using the default Node.js trust store.
+
+The existing `socksProxy` configuration and `--socksProxy` option remain supported for backward compatibility, but only accept `socks://` and `socks5://`. Do not configure both `proxy` and `socksProxy`.
+
+### 6. 📝 Restricting Commands With Whitelist / Blacklist
+
+Use `--whitelist` and `--blacklist` to limit which commands the server is allowed to run. Patterns are comma-separated regular expressions. **Strongly recommended** for any production use. Whitelist patterns must match the entire command. When a whitelist is enabled, commands containing `;`, `&`, `|`, backticks, `$()`, `>`, `<`, or line breaks are rejected before matching, so shell chaining, pipelines, redirection, and command substitution cannot bypass validation.
+
+Whitelist example (only allow read-only inspection commands):
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "192.168.1.1",
+        "--port", "22",
+        "--username", "root",
+        "--password", "pwd123456",
+        "--whitelist", "^ls(?: [A-Za-z0-9_./-]+)*$,^cat [A-Za-z0-9_./-]+$,^df(?: -[A-Za-z]+)*(?: [A-Za-z0-9_./-]+)?$"
+      ]
+    }
+  }
+}
+```
+
+Blacklist example (block destructive commands):
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "192.168.1.1",
+        "--port", "22",
+        "--username", "root",
+        "--password", "pwd123456",
+        "--blacklist", "^\\s*[rR][mM] .*,^\\s*[sS][hH][uU][tT][dD][oO][wW][nN].*,^\\s*[rR][eE][bB][oO][oO][tT].*"
+      ]
+    }
+  }
+}
+```
+
+> Note: Blacklist patterns are case-sensitive by default: `^shutdown.*` does not stop `Shutdown /a`. The example uses character classes such as `[sS]` for compatibility across Node.js versions, without scoped modifiers such as `(?i:pattern)`. Older Node.js versions may not support scoped modifiers; bare `(?i)` is also unsupported in JavaScript. Invalid patterns make the server fail at startup. Escape backslashes inside JSON: write `\\s` for the regex `\s` to tolerate leading whitespace.
+>
+> Note: If both whitelist and blacklist are specified, the command must fully match a whitelist pattern and must not match a blacklist pattern. Always use explicit `^` and `$` anchors in whitelist patterns to make them easy to read and audit. If several operations must be combined, put that logic in a separately reviewed script and whitelist only the fixed script invocation; do not try to parse shell syntax with simple string splitting.
+
+### 7. 🧩 Wrapping Commands With a Template
+
+`commandTemplate` wraps every executed command in a template — useful for switching user via `su`, running inside a container, or jumping through another host. Use `<quotedCommand>` when the command is passed as a shell argument, or `<command>` for raw insertion. The template is applied **after** the working-directory `cd` is prepended, so the entire `cd ... && <actual command>` chain gets wrapped.
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "10.0.0.1",
+        "--port", "22",
+        "--username", "deploy",
+        "--password", "xxx",
+        "--command-template", "su root -c <quotedCommand>"
+      ]
+    }
+  }
+}
+```
+
+Executing `ls /app` with directory `/data` actually sends:
+
+```
+su root -c 'cd -- '\''/data'\'' && ls /app'
+```
+
+Other useful templates:
+
+```text
+sudo bash -c <quotedCommand>
+docker exec -i mycontainer sh -c <quotedCommand>
+ssh jumphost <quotedCommand>
+```
+
+### 8. 🚇 Bastion / Jump Host (`transportMode: shell`)
+
+`transportMode` defaults to `exec`. Switch to `shell` when:
+
+- SSH login succeeds but `exec` command execution fails
+- The remote side requires shell startup scripts, banners, or environment initialization first
+- The target effectively exposes only an interactive shell (bastion hosts, jump hosts, network devices)
+
+Behavior differences:
+
+- `exec`: supports `execute-command`, `upload`, and `download`
+- `shell`: runs commands through a persistent shell session with an internal command queue, but does **not** support `upload` / `download` because SFTP is unavailable in this mode
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "bastion.example.com",
+        "--port", "22",
+        "--username", "ops",
+        "--password", "pwd123456",
+        "--transport-mode", "shell",
+        "--shell-ready-timeout", "15000"
+      ]
+    }
+  }
+}
+```
+
+In JSON config files you can also set `shellCommandTimeoutMs` to override the default per-command timeout for shell-backed connections.
+
+### 9. 🔐 Multi-Factor Authentication (2FA / MFA)
+
+When the SSH server requires multi-factor authentication (password + private key + 2FA verification code), enable `tryKeyboard`. The password and private key are auto-supplied. For non-password prompts, set `SSH_MCP_2FA_CODE` in the server environment before connecting.
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "example.com",
+        "--port", "22",
+        "--username", "user",
+        "--password", "your_password",
+        "--privateKey", "/path/to/key",
+        "--try-keyboard"
+      ]
+    }
+  }
+}
+```
+
+**Authentication flow:**
+1. Private key authentication (if provided)
+2. Password authentication (if provided)
+3. Keyboard-interactive for 2FA code via `SSH_MCP_2FA_CODE`
+
+### 10. 🧩 Managing Multiple SSH Connections
+
+When you need to expose more than one SSH target through the same MCP server, register them under unique connection names and select the target at call time via `connectionName`. There are four ways to configure them:
+
+#### 📄 Method 1: Using Config File (Recommended)
+
+Create a JSON configuration file (e.g., `ssh-config.json`):
+
+**Array Format:**
+```json
+[
+  {
+    "name": "dev",
+    "host": "1.2.3.4",
+    "port": 22,
+    "username": "alice",
+    "password": "{abc=P100s0}",
+    "socksProxy": "socks://127.0.0.1:10808",
+    "commandTimeoutMs": 120000,
+    "maxOutputBytes": 10485760
+  },
+  {
+    "name": "bastion",
+    "host": "9.9.9.9",
+    "port": 22,
+    "username": "ops",
+    "password": "pwd123456",
+    "transportMode": "shell",
+    "shellReadyTimeoutMs": 15000,
+    "shellCommandTimeoutMs": 45000,
+    "connectionTimeoutMs": 30000,
+    "keepaliveIntervalMs": 10000,
+    "keepaliveCountMax": 3
+  },
+  {
+    "name": "prod",
+    "host": "5.6.7.8",
+    "port": 22,
+    "username": "bob",
+    "password": "yyy",
+    "socksProxy": "socks://127.0.0.1:10808"
+  },
+  {
+    "name": "secure-server",
+    "host": "secure.example.com",
+    "port": 22,
+    "username": "admin",
+    "password": "your_password",
+    "privateKey": "/path/to/private/key",
+    "tryKeyboard": true
+  }
+]
+```
+
+**Object Format:**
+```json
+{
+  "dev": {
+    "host": "1.2.3.4",
+    "port": 22,
+    "username": "alice",
+    "password": "{abc=P100s0}",
+    "socksProxy": "socks://127.0.0.1:10808",
+    "commandTimeoutMs": 120000,
+    "maxOutputBytes": 10485760
+  },
+  "bastion": {
+    "host": "9.9.9.9",
+    "port": 22,
+    "username": "ops",
+    "password": "pwd123456",
+    "transportMode": "shell",
+    "shellReadyTimeoutMs": 15000,
+    "shellCommandTimeoutMs": 45000
+  },
+  "prod": {
+    "host": "5.6.7.8",
+    "port": 22,
+    "username": "bob",
+    "password": "yyy",
+    "socksProxy": "socks://127.0.0.1:10808"
+  }
+}
+```
+
+Then use the `--config-file` parameter:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--config-file", "ssh-config.json"
+      ]
+    }
+  }
+}
+```
+
+#### 🔧 Method 2: Using JSON Format with --ssh Parameter
+
+You can pass JSON-formatted configuration strings directly:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--ssh", "{\"name\":\"dev\",\"host\":\"1.2.3.4\",\"port\":22,\"username\":\"alice\",\"password\":\"{abc=P100s0}\",\"socksProxy\":\"socks://127.0.0.1:10808\"}",
+        "--ssh", "{\"name\":\"bastion\",\"host\":\"9.9.9.9\",\"port\":22,\"username\":\"ops\",\"password\":\"pwd123456\",\"transportMode\":\"shell\",\"shellReadyTimeoutMs\":15000}",
+        "--ssh", "{\"name\":\"prod\",\"host\":\"5.6.7.8\",\"port\":22,\"username\":\"bob\",\"password\":\"yyy\",\"socksProxy\":\"socks://127.0.0.1:10808\"}"
+      ]
+    }
+  }
+}
+```
+
+#### 📝 Method 3: Legacy Comma-Separated Format (Backward Compatible)
+
+For simple cases without special characters in passwords, you can still use the legacy format:
+
+```bash
+npx @fangjunjie/ssh-mcp-server \
+  --ssh "name=dev,host=1.2.3.4,port=22,user=alice,password=xxx" \
+  --ssh "name=prod,host=5.6.7.8,port=22,user=bob,password=yyy"
+```
+
+> **⚠️ Note**: The legacy format may have issues with passwords containing special characters like `=`, `,`, `{`, `}`. Use Method 1 or Method 2 for passwords with special characters.
+
+#### 🔑 Method 4: Comma-Separated Multi-Value --host (Reusing ~/.ssh/config)
+
+`--host` accepts a comma-separated list of hosts, which switches the server into multi-connection mode: each host becomes an independent connection named after the host value itself, while a single `--host` value keeps the original single-host behavior (connection name remains `default`). Every host independently follows the same merge rules as single-host mode — an alias that matches SSH config expands to its HostName/Port/User/IdentityFile, and command-line parameters override field by field. This is ideal when all your hosts are already defined in `~/.ssh/config`, with no JSON needed:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@fangjunjie/ssh-mcp-server",
+        "--host", "myserver,anotherserver",
+        "--pty", "false"
+      ]
+    }
+  }
+}
+```
+
+Authentication resolution follows one of two modes depending on whether CLI authentication parameters (`--password`/`--privateKey`/`--agent`) are provided:
+
+- **Not provided**: each alias resolves its own authentication from SSH config (the alias's IdentityFile first, then `~/.ssh` default identity file fallback, then the SSH agent)
+- **Provided**: all hosts share the CLI authentication and SSH config IdentityFile entries are ignored (aliases and bare IPs behave identically, differing only in address expansion); `--passphrase` acts as the key decryption passphrase and is shareable
+
+All other CLI policy parameters (`--pty`, `--whitelist`, timeouts, etc.) serve as process-level defaults shared by every host, with no per-server repetition needed. If any host lacks a username or authentication source, startup fails immediately listing that host. When different hosts need different policies (port, whitelist, timeout, etc.), use Method 1 instead.
+
+In MCP tool calls, specify the connection name via the `connectionName` parameter. If omitted, the default connection is used.
+
+Example (execute command on 'prod' connection):
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "cmdString": "ls -al",
+    "connectionName": "prod"
+  }
+}
+```
+
+Example (execute command with timeout options):
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "cmdString": "ping -c 10 127.0.0.1",
+    "connectionName": "prod",
+    "timeout": 5000
+  }
+}
+```
+
+### ⏱️ Command Execution Timeout
+
+The `execute-command` tool supports timeout options to prevent commands from hanging indefinitely:
+
+- **timeout**: Per-call command execution timeout in milliseconds (optional); when provided, it overrides the connection setting, otherwise the connection setting or its 30000ms default is used
+- Set `commandTimeoutMs` per connection in the JSON config file to change that default, so callers do not have to pass `timeout` on every call (`exec` mode)
+- The `shell` mode equivalent is `shellCommandTimeoutMs`
+- A `timeout` passed with the call always takes precedence over both settings
+- Connections use SSH keepalives by default (`keepaliveIntervalMs`: 10000, `keepaliveCountMax`: 3) and respect `connectionTimeoutMs` for connection setup
+- SFTP open and transfer operations respect `sftpTimeoutMs` (default 300000ms)
+- Error responses include stable `code`, `message`, and `retriable` fields for easier agent-side handling
+- A command that ran but exited non-zero (e.g. `grep` with no match, `diff` with differences) is returned as its output followed by `[exit code] N`, not as a tool error and not wrapped in JSON. Real failures (timeout, connection, validation) still return `code`/`message`/`retriable` as described above
+
+This is particularly useful for commands like `ping`, `tail -f`, or other long-running processes that might block execution.
+
+### 📜 Quoting & the `script` Parameter
+
+`cmdString` is passed **verbatim** to the remote login shell (exactly like `ssh host '<cmdString>'`). Use a single level of shell quoting — do **not** add extra escaping layers for SSH or JSON:
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "cmdString": "grep -r 'pattern with spaces' /var/log"
+  }
+}
+```
+
+Commands that need quotes **inside** quotes (nested quoting, e.g. inside `docker exec`, `python -c`, or `bash -c`) are where escaping mistakes happen. For those use the `script` parameter instead: its content is base64-transported and executed verbatim by remote `bash` — **no escaping of quotes is needed at all**:
+
+```json
+{
+  "tool": "execute-command",
+  "params": {
+    "script": "docker exec homeassistant python3 -c \"import sqlite3; c=sqlite3.connect('/config/home-assistant_v2.db'); print(c.execute('SELECT COUNT(*) FROM states').fetchone())\"",
+    "timeout": 15000
+  }
+}
+```
+
+`script` and `cmdString` are mutually exclusive. The `directory` parameter and `commandTemplate` apply to `script` the same way they apply to `cmdString`. Windows-style line endings (`\r\n`) in either parameter are normalized to `\n` before execution. When the remote shell cannot parse a command (e.g. over-escaped quotes), the response includes the exact command as executed plus a hint to retry with `script`.
+
+### 🛡️ Command Guard
+
+Nothing is hard-blocked — the guard exists so the server is not harmed by accident, while still allowing disk formatting, partitioning and other legitimate work.
+
+- **Read-only commands** (`ls`, `cat`, `docker ps`, `systemctl status`, `curl`, …) execute immediately, no approval.
+- **Write commands** require user approval. The guard distinguishes:
+  - *user-level changes* — files, directories, processes (`rm`, `mkdir`, `sed -i`, interpreters like `bash`/`python3`, file redirects, …)
+  - *system-impacting changes* — disks, services, network, packages, users (`mkfs`, `dd of=/dev/…`, `reboot`, `apt install`, `systemctl restart`, `mount`, `iptables`, …)
+- Approval options offered to the user: **allow once**, **allow this exact command for the session**, **allow ALL commands for the session**, or **deny**. The prompt is shown via MCP elicitation when the client supports it.
+- If the client cannot show interactive prompts, the tool returns a `COMMAND_CONFIRMATION_REQUIRED` error containing a `confirmationId`. Ask the user, then retry the same call with `confirmationId` (add `rememberApproval: true` to allow this exact command for the session). Rejection returns `COMMAND_BLOCKED_BY_USER`.
+- Classification is heuristic and fails closed: unknown verbs, file redirects, subshells and anything ambiguous are treated as writes and asked about.
+- Set `SSH_MCP_GUARD=off` to disable the guard entirely (non-interactive automation).
+
+### 📄 File Read/Write and Directory Transfer
+
+- `read-file` reads one byte range of a remote text file (`offset`/`length`, at most 65536 bytes by default). The result starts with a `[bytes] start-end of total` header and names the `next offset` when more remains, so large files can be paged. Binary content (NUL bytes or a large share of invalid UTF-8) is refused with a hint to use `download`
+- `write-file` writes text straight to a remote file (`append: true` appends, `mode` sets the permission bits of a newly created file). The content never passes through a shell, so quotes, `$`, backticks and multi-line text need no escaping
+- `upload` / `download` transfer a directory recursively when the path is a directory: the remote directory is created if missing, symlinks and other non-regular entries are skipped, and at most 2000 files are transferred per call (archive larger trees first). Files are transferred one by one with the same path checks as a single file
+- All of these use SFTP, respect `allowedLocalPaths` / `allowedRemotePaths`, and are unavailable in `shell` mode
+
+### 📦 Command Output Limit
+
+The combined captured `stdout` and `stderr` for each command is limited to protect the MCP server from large files or unbounded output:
+
+- Set `maxOutputBytes` in a JSON connection configuration; the default is `10485760` bytes (10 MiB)
+- `maxOutputBytes` must be a non-negative integer; `0` disables the limit, which is not recommended for untrusted commands
+- When output exceeds the limit, the remote command is aborted and the tool returns an `OUTPUT_LIMIT_EXCEEDED` error with the captured, truncated output instead of reporting success
+- With `pty: false`, warnings and progress written to `stderr` by successful commands are preserved in a `[stderr]` section
+- The limit applies to both `exec` and `shell` mode. `exec` mode closes just that command's channel, whereas the `shell` channel is shared by every command on the connection and the remote keeps writing after an abort, so the connection is dropped instead — the same way a shell mode command timeout behaves
+
+### 🧵 Background Jobs
+
+`execute-command` gives up on a command once it times out. Long tasks such as builds and deploys should use background jobs instead:
+
+- `job-start` starts the command in the background on the server and returns a `job_id` right away. The command goes through `commandWhitelist` / `commandBlacklist` exactly like `execute-command`
+- `job-status` returns the state (`running` / `exited` / `killed` / `lost`), exit code, elapsed time and output. Without `offset` it returns the end of the output (`tailBytes`, default 8192); with `offset` it continues from that byte and names the `next offset`, so repeated polling only reads what is new
+- `job-kill` sends `SIGTERM`, then `SIGKILL` after 5 seconds, and terminates child processes recursively
+- `job-list` lists recent jobs with their state
+- Job state (command, output, pid, exit code) lives on the server under `~/.ssh-mcp-jobs/<id>/`, so it survives an MCP restart or a dropped SSH connection. Job directories older than 7 days are pruned on the next `job-start`
+- `job-kill` only signals a process whose command line carries the job id, so a reused pid can never make it kill an unrelated process; such a job is reported as `lost`
+- The server needs a POSIX `sh`; with `setsid` available a job gets its own process group. Works in `shell` (bastion) mode too
+
+### 🗂️ List All SSH Servers
+
+You can use the MCP tool `list-servers` to get all available SSH serve (comma-separated values enable multi-connection mode)r configurations:
+
+Example call:
+
+```json
+{
+  "tool": "list-servers",
+  "params": {}
+}
+```
+
+Example response:
+
+```json
+[
+  { "name": "dev", "host": "1.2.3.4", "port": 22, "username": "alice" },
+  { "name": "prod", "host": "5.6.7.8", "port": 22, "username": "bob" }
+]
+```
+
+### 🌐 HTTP Transport (Streamable HTTP)
+
+The process uses stdio by default, so existing `command` / `args` client configs keep working. To let a client connect by URL, start the same process with `--mcp-transport http`. It then serves MCP Streamable HTTP, by default at `http://127.0.0.1:3000/mcp`.
+
+Start the server locally. Keep the token in an environment variable so it does not show up in the process list:
+
+```bash
+export SSH_MCP_HTTP_TOKEN='replace-with-a-long-random-token'
+npx -y @fangjunjie/ssh-mcp-server \
+  --mcp-transport http \
+  --http-host 127.0.0.1 \
+  --http-port 3000 \
+  --host 192.168.1.1 \
+  --port 22 \
+  --username root \
+  --privateKey ~/.ssh/id_rsa
+```
+
+Point the MCP client at that URL:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer replace-with-a-long-random-token"
+      }
+    }
+  }
+}
+```
+
+When both `--http-token` and `SSH_MCP_HTTP_TOKEN` are set, the command-line value wins. Without a token, bind to `127.0.0.1` only. Listening on `0.0.0.0` or any other non-local address lets every client that can reach the port run remote commands; the process prints a warning at startup.
+
+### ⚙️ Command Line Options Reference
+
+```text
+Options:
+  --config-file       JSON configuration file path (recommended for multiple servers)
+  --ssh-config-file   SSH config file path (default: ~/.ssh/config)
+  --ssh               SSH connection configuration (can be JSON string or legacy format)
+  -h, --host          SSH server host address or alias from SSH config
+  -p, --port          SSH server port
+  -u, --username      SSH username
+  -w, --password      SSH password
+  -k, --privateKey    SSH private key file path
+  -P, --passphrase    Private key passphrase (if any)
+  -a, --agent         SSH agent socket path
+  --try-keyboard      Enable keyboard-interactive authentication for 2FA/MFA (default: false)
+  -W, --whitelist     Command whitelist, comma-separated regular expressions
+  -B, --blacklist     Command blacklist, comma-separated regular expressions
+  --proxy             Proxy URL supporting SOCKS5, HTTP, and HTTPS
+  -s, --socksProxy    Legacy SOCKS5 proxy URL
+  --allowed-local-paths   Additional allowed local paths for upload/download, comma-separated
+  --allowed-remote-paths  Allowed remote paths (POSIX absolute or Windows drive-absolute, e.g. /var/log or C:/Users) for SFTP upload/download, comma-separated
+  --transport-mode    SSH transport mode: exec or shell (default: exec)
+  --shell-ready-timeout   Shell readiness probe timeout in milliseconds (default: 10000)
+  --command-template  Command template, use <quotedCommand> for shell arguments or <command> for raw insertion
+  --pty               Allocate pseudo-tty for command execution (default: true)
+  --pre-connect       Pre-connect to all configured SSH servers on startup
+  --mcp-transport     MCP client transport: stdio or http (default: stdio)
+  --http-host         HTTP bind address (default: 127.0.0.1)
+  --http-port         HTTP listen port (default: 3000; 0 lets the OS assign one)
+  --http-path         HTTP endpoint path (default: /mcp)
+  --http-token        HTTP bearer token; falls back to the SSH_MCP_HTTP_TOKEN environment variable
+  --version, -v       Print package version
+  --help              Print this help message
+```
+
+## 🛡️ Security Considerations
+
+This server provides powerful capabilities to execute commands and transfer files on remote servers. To ensure it is used securely, please consider the following:
+
+- **Command Whitelisting**: It is *strongly recommended* to use the `--whitelist` option to restrict the set of commands that can be executed. Without a whitelist, any command can be executed on the remote server, which can be a significant security risk.
+- **Private Key Security**: The server reads the SSH private key into memory. Ensure that the machine running the `ssh-mcp-server` is secure. Do not expose the server to untrusted networks.
+- **HTTP Endpoint**: HTTP mode binds to `127.0.0.1` by default. Set `--http-token` or `SSH_MCP_HTTP_TOKEN` before listening on another interface. The token is the key to remote command execution; use a long random value and prefer the environment variable.
+- **Denial of Service (DoS)**: The server does not have built-in rate limiting. An attacker could potentially launch a DoS attack by flooding the server with connection requests or large file transfers. It is recommended to run the server behind a firewall or reverse proxy with rate-limiting capabilities.
+- **Path Traversal**: The server has built-in protection against path traversal attacks on the local filesystem. However, it is still important to be mindful of the paths used in `upload` and `download` commands.
+- **Local Transfer Scope**: By default, local file transfers are restricted to the current working directory. Use `--allowed-local-paths` or `allowedLocalPaths` in config only for explicitly trusted directories.
+- **Remote Transfer Scope**: SFTP upload/download accepts POSIX absolute paths (e.g. `/var/log/app.log`) and Windows drive-absolute paths (e.g. `C:/Users/foo/bar.txt`, auto-normalized to forward slashes). If `allowedRemotePaths` (or `--allowed-remote-paths`) is not configured, any remote path is accepted and the server prints a startup warning. Configure `allowedRemotePaths` to whitelist a small set of remote directories; this is strongly recommended to prevent prompt-injection-driven reads or writes of files like `~/.ssh/authorized_keys` or `/etc/sshd_config`.
+
+## 🌟 Star History
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=classfang/ssh-mcp-server&type=date&legend=top-left&sealed_token=ndORao73xOZgyX7IvlIIOynMoeEP5Ds9YAG-zOfMMBlNepLdP3e7T7k9K94X8TdvuxplN5DXLolbF9jFFsYDD-1V0V8HO6B3swaPOvJaonKeiFNdAuWsXg)](https://www.star-history.com/?type=date&legend=top-left&repos=classfang%2Fssh-mcp-server)
