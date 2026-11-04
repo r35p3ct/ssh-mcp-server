@@ -609,7 +609,7 @@ Nothing is hard-blocked — the guard exists so the server is not harmed by acci
 - **Write commands** require user approval. The guard distinguishes:
   - *user-level changes* — files, directories, processes (`rm`, `mkdir`, `sed -i`, interpreters like `bash`/`python3`, file redirects, …)
   - *system-impacting changes* — disks, services, network, packages, users (`mkfs`, `dd of=/dev/…`, `reboot`, `apt install`, `systemctl restart`, `mount`, `iptables`, …)
-- Approval options offered to the user: **allow once**, **allow this exact command for the session**, **allow ALL commands for the session**, or **deny**. The prompt is shown via MCP elicitation when the client supports it.
+- Approval options offered to the user: **allow once**, **allow this exact command for the session**, **allow ALL commands for the session**, or **deny**. The prompt is shown via MCP elicitation when the client supports it, and the exact command is embedded in the approval form as a read-only field, so it is visible in the popup even when the client does not render the request message.
 - If the client cannot show interactive prompts, the tool returns a `COMMAND_CONFIRMATION_REQUIRED` error containing a `confirmationId`. Ask the user, then retry the same call with `confirmationId` (add `rememberApproval: true` to allow this exact command for the session). Rejection returns `COMMAND_BLOCKED_BY_USER`.
 - Classification is heuristic and fails closed: unknown verbs, file redirects, subshells and anything ambiguous are treated as writes and asked about.
 - Set `SSH_MCP_GUARD=off` to disable the guard entirely (non-interactive automation).

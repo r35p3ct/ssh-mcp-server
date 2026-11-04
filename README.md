@@ -615,7 +615,7 @@ npx @fangjunjie/ssh-mcp-server \
 - **写入类命令**需要用户确认。防护会区分两级风险：
   - *用户级修改* —— 文件、目录、进程（`rm`、`mkdir`、`sed -i`、`bash`/`python3` 等解释器、文件重定向等）
   - *系统级影响* —— 磁盘、服务、网络、软件包、用户（`mkfs`、`dd of=/dev/…`、`reboot`、`apt install`、`systemctl restart`、`mount`、`iptables` 等）
-- 提供给用户的确认选项：**仅本次允许**、**本会话内允许该命令**、**本会话内允许全部命令**、**拒绝**。客户端支持 MCP elicitation 时以交互形式弹出。
+- 提供给用户的确认选项：**仅本次允许**、**本会话内允许该命令**、**本会话内允许全部命令**、**拒绝**。客户端支持 MCP elicitation 时以交互形式弹出，且待确认的命令会以只读字段内嵌在表单中，即使客户端不展示请求 message，用户也能在弹窗里看到具体命令。
 - 客户端不支持交互确认时，工具返回带 `confirmationId` 的 `COMMAND_CONFIRMATION_REQUIRED` 错误。先向用户确认，再带上 `confirmationId` 重试同一调用（加 `rememberApproval: true` 可在本会话内放行该命令）。用户拒绝时返回 `COMMAND_BLOCKED_BY_USER`。
 - 分类是启发式的且宁可多问：未知命令、文件重定向、子 shell 等一律按写入类处理。
 - 设置 `SSH_MCP_GUARD=off` 可完全关闭防护（用于非交互自动化）。

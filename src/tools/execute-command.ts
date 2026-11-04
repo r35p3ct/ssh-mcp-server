@@ -15,25 +15,50 @@ import {
   normalizeEol,
 } from "../utils/command-guard.js";
 
-const APPROVAL_CHOICE_SCHEMA = {
-  type: "object" as const,
-  properties: {
-    choice: {
-      type: "string" as const,
-      title: "Approval",
-      description: "Approve execution of this command",
-      enum: ["once", "session_command", "session_all", "deny"],
-      enumNames: [
-        "Allow once",
-        "Allow this command for the session",
-        "Allow ALL commands for the session",
-        "Deny",
-      ],
-      default: "once",
+const APPROVAL_COMMAND_PREVIEW_MAX_LENGTH = 500;
+
+function commandPreview(command: string): string {
+  return command.length > APPROVAL_COMMAND_PREVIEW_MAX_LENGTH
+    ? `${command.slice(0, APPROVAL_COMMAND_PREVIEW_MAX_LENGTH)}…(truncated)`
+    : command;
+}
+
+/**
+ * Elicitation form for one command approval. The command itself is embedded
+ * as a read-only single-option field (enum of one value), because some
+ * clients render only the schema fields in the popup and hide or clip the
+ * request `message`. All keys used here are part of the MCP elicitation
+ * schema surface: type, title, description, enum, enumNames, default.
+ */
+export function buildApprovalSchema(command: string) {
+  const preview = commandPreview(command);
+  return {
+    type: "object" as const,
+    properties: {
+      command: {
+        type: "string" as const,
+        title: "Command",
+        description: "The exact command that requires approval (read-only)",
+        enum: [preview],
+        enumNames: [preview],
+      },
+      choice: {
+        type: "string" as const,
+        title: "Approval",
+        description: "Approve execution of this command",
+        enum: ["once", "session_command", "session_all", "deny"],
+        enumNames: [
+          "Allow once",
+          "Allow this command for the session",
+          "Allow ALL commands for the session",
+          "Deny",
+        ],
+        default: "once",
+      },
     },
-  },
-  required: ["choice"],
-};
+    required: ["choice"],
+  };
+}
 
 type Decision = { allowed: true } | { allowed: false; payload: Record<string, unknown> };
 
@@ -91,7 +116,7 @@ async function approveCommand(
   try {
     const result = await server.server.elicitInput({
       message,
-      requestedSchema: APPROVAL_CHOICE_SCHEMA,
+      requestedSchema: buildApprovalSchema(command),
     });
 
     if (result.action === "accept") {
